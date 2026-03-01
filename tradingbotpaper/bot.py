@@ -28,6 +28,10 @@ SYMBOL_DEFAULT = "BTC/EUR"
 IN_CRITICAL = False
 STOP_REQUESTED = False
 
+# Heartbeat (ogni N ore) — default 2 ore
+HEARTBEAT_HOURS = float(os.getenv("KRAKEN_HEARTBEAT_HOURS", "2") or "2")
+HEARTBEAT_SECONDS = max(15 * 60, int(HEARTBEAT_HOURS * 3600))  # minimo 15 min anti-bug
+
 STATE = {
     "in_pos": False,
     "entry_price": None,
@@ -144,6 +148,32 @@ def _telemetry(**kwargs):
             pass
 
 
+def _fmt_money(x):
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return str(x)
+
+
+def _fmt_btc(x):
+    try:
+        return f"{float(x):.8f}"
+    except Exception:
+        return str(x)
+
+
+def _heartbeat_message(symbol, timeframe, price, eur_free, btc_free, in_position, regime, mode):
+    pos = "✅ IN POSIZIONE" if in_position else "❌ fuori posizione"
+    return (
+        "🫀 *Heartbeat Kraken*\n"
+        f"• {symbol} | tf={timeframe}\n"
+        f"• price: `{_fmt_money(price)}`\n"
+        f"• EUR: `{_fmt_money(eur_free)}` | BTC: `{_fmt_btc(btc_free)}`\n"
+        f"• stato: {pos}\n"
+        f"• regime: `{regime}` | mode: `{mode}`\n"
+    )
+
+
 def run_live(cfg: dict):
     global IN_CRITICAL, STOP_REQUESTED
 
@@ -177,6 +207,9 @@ def run_live(cfg: dict):
     last_eval_key = None
     last_regime = None
 
+    # Heartbeat timer
+    next_hb = time.time() + HEARTBEAT_SECONDS
+
     print(f"[bold red]LIVE AUTO bot avviato[/bold red] | {symbol} | tf={timeframe}")
     print(f"spend_pct={spend_pct:.2f} | min_trade_eur={min_trade_eur:.2f}")
 
@@ -198,6 +231,26 @@ def run_live(cfg: dict):
         ticker = ex.fetch_ticker(symbol)
         last_price = safe_float(ticker.get("last"), 0.0)
         ask = safe_float(ticker.get("ask"), last_price)
+
+        # ---- heartbeat every N hours ----
+        now_ts = time.time()
+        if now_ts >= next_hb:
+            try:
+                hb = _heartbeat_message(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    price=last_price,
+                    eur_free=eur_free,
+                    btc_free=btc_free,
+                    in_position=in_position,
+                    regime=(last_regime or "n/a"),
+                    mode=(STATE.get("mode") or "n/a"),
+                )
+                send_telegram(hb)
+            except Exception:
+                pass
+            next_hb = now_ts + HEARTBEAT_SECONDS
+            _telemetry(note="Heartbeat sent")
 
         print(f"LIVE status | price={last_price:.2f} | EUR={eur_free:.2f} | BTC={btc_free:.8f} | tf={timeframe}")
 
