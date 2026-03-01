@@ -20,16 +20,28 @@ def fpr(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
 
 
-def ensure_project_root():
+def ensure_project_root() -> Path:
     root = Path(__file__).resolve().parent
     os.chdir(str(root))
     return root
 
 
+def run_anacleto_blocking_in_thread():
+    """
+    PTB run_polling() in un thread richiede un event loop ASSOCIATO a quel thread.
+    Quindi lo creiamo e lo settiamo prima di chiamare il bot.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    from anacleto_bot import run_polling_blocking
+    run_polling_blocking()
+
+
 async def run_anacleto_supervisor():
     """
     Avvia Anacleto (polling) in un thread.
-    Se Telegram risponde Conflict, aspetta e riprova (senza creare due istanze).
+    Se crasha, riprova con backoff.
     """
     from telegram.error import Conflict
 
@@ -37,13 +49,11 @@ async def run_anacleto_supervisor():
     while True:
         try:
             log.info("ANACLETO: avvio…")
-            # Import qui per essere sicuri del cwd già corretto
-            from anacleto_bot import run_polling_blocking
-            await asyncio.to_thread(run_polling_blocking)
+            await asyncio.to_thread(run_anacleto_blocking_in_thread)
 
-            # se esce "pulito", riparte dopo poco
             log.warning("ANACLETO: terminato. Riavvio tra 5s…")
             await asyncio.sleep(5)
+            backoff = 8
 
         except Conflict:
             log.error("ANACLETO: Conflict (altra istanza in polling). Attendo %ss e riprovo…", backoff)
@@ -70,11 +80,15 @@ async def kraken_supervisor(cfg_path: str):
         try:
             log.info("KRAKEN: avvio con config=%s", cfg_path)
             await asyncio.to_thread(run_kraken_sync_wrapper, cfg_path)
+
             log.warning("KRAKEN: terminato. Riavvio tra 10s…")
             await asyncio.sleep(10)
+            backoff = 30
+
         except Exception as e:
             log.exception("KRAKEN: crash. Riprovo tra %ss… (%s)", backoff, e)
             await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)
 
 
 async def main_async():
@@ -88,7 +102,11 @@ async def main_async():
     log.info("==============================================")
     log.info("RUNNER START | PID=%s", os.getpid())
     log.info("HOST=%s", os.getenv("HOSTNAME", "n/a"))
-    log.info("RENDER_SERVICE_NAME=%s | RENDER_INSTANCE_ID=%s", os.getenv("RENDER_SERVICE_NAME","n/a"), os.getenv("RENDER_INSTANCE_ID","n/a"))
+    log.info(
+        "RENDER_SERVICE_NAME=%s | RENDER_INSTANCE_ID=%s",
+        os.getenv("RENDER_SERVICE_NAME", "n/a"),
+        os.getenv("RENDER_INSTANCE_ID", "n/a"),
+    )
     log.info("BOT_TOKEN_FPR=%s (sha256[:10])", fpr(bot_token))
     log.info("TRADING_DIR in sys.path=%s", str(trading_dir) in sys.path)
     log.info("CWD=%s", os.getcwd())
