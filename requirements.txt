@@ -8,3 +8,5 @@ pandas
 numpy
 pyyaml
 rich
+pymupdf
+rank-bm25
