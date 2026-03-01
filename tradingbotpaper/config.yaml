@@ -1,0 +1,22 @@
+exchange: kraken
+
+live:
+  symbol: "BTC/EUR"
+  timeframe: "1h"
+  ohlcv_limit: 500
+
+  # Quanto EUR libero impegnare a ogni entry
+  spend_pct: 0.50
+
+  # Trade minimo (per evitare ordini troppo piccoli)
+  min_trade_eur: 6.0
+
+  # Strategia A (TREND) - ATR multipliers
+  strategy_A:
+    sl_atr: 1.5
+    tp_atr: 3.0
+
+  # Strategia B (RANGE) - ATR multipliers
+  strategy_B:
+    sl_atr: 1.0
+    tp_atr: 1.2
