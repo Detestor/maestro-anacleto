@@ -497,10 +497,17 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
     q = await get_random_quote()
+
+    text = (
+        f"📜 {q.author}\n"
+        f"“{q.text}”\n\n"
+        f"Fonte: {q.source}\n{q.ref}"
+    )
+
     await update.message.reply_text(
-        fmt_quote_html(q),
-        parse_mode="HTML",
+        text,
         disable_web_page_preview=True,
+    )
     )
 
 
