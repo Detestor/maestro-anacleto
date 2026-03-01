@@ -826,6 +826,7 @@ async def post_init(application):
 
 
 def main():
+    def build_application():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_error_handler(on_error)
@@ -833,7 +834,6 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("test_gm", cmd_test_gm))
@@ -841,9 +841,14 @@ def main():
 
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-    print(f"{BOT_DISPLAY} è in ascolto…")
+    return app
+
+
+def main_polling():
+    app = build_application()
+    print(f"{BOT_DISPLAY} è in ascolto… (polling locale)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    main()
+    main_polling()
