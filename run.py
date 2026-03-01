@@ -2,140 +2,108 @@ from __future__ import annotations
 
 import os
 import sys
-import time
-import signal
-import threading
+import asyncio
 import logging
 import hashlib
+from pathlib import Path
 
-# ---- logging ----
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("RUNNER")
 
-LOCK_FILE = "/tmp/maestro_anacleto_runner.lock"
+
+def fpr(s: str) -> str:
+    if not s:
+        return "none"
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
+def ensure_project_root():
+    root = Path(__file__).resolve().parent
+    os.chdir(str(root))
+    return root
 
 
-def acquire_runner_lock():
-    if os.path.exists(LOCK_FILE):
+async def run_anacleto_supervisor():
+    """
+    Avvia Anacleto (polling) in un thread.
+    Se Telegram risponde Conflict, aspetta e riprova (senza creare due istanze).
+    """
+    from telegram.error import Conflict
+
+    backoff = 8
+    while True:
         try:
-            with open(LOCK_FILE, "r", encoding="utf-8") as f:
-                old_pid = int((f.read() or "0").strip())
-        except Exception:
-            old_pid = 0
+            log.info("ANACLETO: avvio…")
+            # Import qui per essere sicuri del cwd già corretto
+            from anacleto_bot import run_polling_blocking
+            await asyncio.to_thread(run_polling_blocking)
 
-        if old_pid and _pid_alive(old_pid):
-            raise RuntimeError(f"RUNNER già in esecuzione (pid={old_pid}). Stoppo istanza doppia.")
-        else:
-            try:
-                os.remove(LOCK_FILE)
-            except Exception:
-                pass
+            # se esce "pulito", riparte dopo poco
+            log.warning("ANACLETO: terminato. Riavvio tra 5s…")
+            await asyncio.sleep(5)
 
-    with open(LOCK_FILE, "w", encoding="utf-8") as f:
-        f.write(str(os.getpid()))
+        except Conflict:
+            log.error("ANACLETO: Conflict (altra istanza in polling). Attendo %ss e riprovo…", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
-
-def release_runner_lock():
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.remove(LOCK_FILE)
-    except Exception:
-        pass
+        except Exception as e:
+            log.exception("ANACLETO: crash. Riprovo tra %ss… (%s)", backoff, e)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
-STOP = False
-
-
-def handle_exit(signum, frame):
-    global STOP
-    STOP = True
-    log.warning("Stop richiesto (signal=%s). Chiudo tutto…", signum)
-    release_runner_lock()
-    raise SystemExit(0)
-
-
-def add_paths():
-    # assicura che "tradingbotpaper" e root siano importabili
-    root = os.path.dirname(os.path.abspath(__file__))
-    if root not in sys.path:
-        sys.path.insert(0, root)
-
-    trading_dir = os.path.join(root, "tradingbotpaper")
-    if trading_dir not in sys.path:
-        sys.path.insert(0, trading_dir)
-
-    return root, trading_dir
-
-
-def token_fingerprint(token: str) -> str:
-    if not token:
-        return "missing"
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:10]
-
-
-def kraken_supervisor():
+def run_kraken_sync_wrapper(cfg_path: str):
     """
-    Kraken gira in loop e se crasha riparte dopo 30s.
+    Wrapper sync del Kraken bot (tuo).
     """
-    cfg_path = os.getenv("KRAKEN_CONFIG", "tradingbotpaper/config.yaml")
-    while not STOP:
+    from tradingbotpaper.bot import run_kraken_sync
+    run_kraken_sync(cfg_path)
+
+
+async def kraken_supervisor(cfg_path: str):
+    backoff = 30
+    while True:
         try:
             log.info("KRAKEN: avvio con config=%s", cfg_path)
-            from tradingbotpaper.bot import run_kraken_sync
-            run_kraken_sync(cfg_path)
-            log.warning("KRAKEN: terminato (strano). Riprovo tra 30s…")
+            await asyncio.to_thread(run_kraken_sync_wrapper, cfg_path)
+            log.warning("KRAKEN: terminato. Riavvio tra 10s…")
+            await asyncio.sleep(10)
         except Exception as e:
-            log.exception("KRAKEN: crashato. Riprovo tra 30s… (%s)", e)
-
-        for _ in range(30):
-            if STOP:
-                return
-            time.sleep(1)
+            log.exception("KRAKEN: crash. Riprovo tra %ss… (%s)", backoff, e)
+            await asyncio.sleep(backoff)
 
 
-def main():
-    global STOP
-
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-
-    acquire_runner_lock()
-    root, trading_dir = add_paths()
+async def main_async():
+    root = ensure_project_root()
 
     bot_token = os.getenv("BOT_TOKEN", "")
+    trading_dir = (root / "tradingbotpaper")
+    if str(trading_dir) not in sys.path:
+        sys.path.insert(0, str(trading_dir))
+
     log.info("==============================================")
     log.info("RUNNER START | PID=%s", os.getpid())
     log.info("HOST=%s", os.getenv("HOSTNAME", "n/a"))
-    log.info("RENDER_SERVICE_NAME=%s | RENDER_INSTANCE_ID=%s",
-             os.getenv("RENDER_SERVICE_NAME", "n/a"),
-             os.getenv("RENDER_INSTANCE_ID", "n/a"))
-    log.info("BOT_TOKEN_FPR=%s (sha256[:10])", token_fingerprint(bot_token))
-    log.info("TRADING_DIR in sys.path=%s", trading_dir in sys.path)
+    log.info("RENDER_SERVICE_NAME=%s | RENDER_INSTANCE_ID=%s", os.getenv("RENDER_SERVICE_NAME","n/a"), os.getenv("RENDER_INSTANCE_ID","n/a"))
+    log.info("BOT_TOKEN_FPR=%s (sha256[:10])", fpr(bot_token))
+    log.info("TRADING_DIR in sys.path=%s", str(trading_dir) in sys.path)
+    log.info("CWD=%s", os.getcwd())
     log.info("==============================================")
 
-    # ---- start Kraken in background thread ----
-    t = threading.Thread(target=kraken_supervisor, name="kraken_supervisor", daemon=True)
-    t.start()
+    cfg_path = "tradingbotpaper/config.yaml"
 
-    # ---- run Anacleto in main thread (ONE polling ONLY) ----
-    log.info("ANACLETO: avvio…")
-    from anacleto_bot import main as anacleto_main
-    anacleto_main()
+    t1 = asyncio.create_task(kraken_supervisor(cfg_path))
+    t2 = asyncio.create_task(run_anacleto_supervisor())
 
-    # se Anacleto esce, chiudiamo tutto
-    STOP = True
-    release_runner_lock()
+    await asyncio.gather(t1, t2)
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
