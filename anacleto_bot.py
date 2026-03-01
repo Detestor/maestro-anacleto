@@ -508,7 +508,7 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text,
         disable_web_page_preview=True,
     )
-    )
+    
 
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
