@@ -1,5 +1,0 @@
-ccxt
-pandas
-numpy
-pyyaml
-rich

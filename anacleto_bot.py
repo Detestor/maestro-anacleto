@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 import os
-import asyncio
+import re
 import datetime as dt
 import logging
 import random
-from typing import Optional, Tuple, List
+import html
+from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 import httpx
+
+from pypdf import PdfReader
 
 from telegram import Update
 from telegram.constants import ChatType
@@ -34,30 +40,36 @@ log = logging.getLogger("ANACLETO")
 # ===================== ENV =====================
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "MaestroAnacletoBot").lstrip("@")
-ALLOWED_GROUP_ID_RAW = os.getenv("ALLOWED_GROUP_ID", "").strip()
-TZ_NAME = os.getenv("TZ", "Europe/Rome")
-BOT_DISPLAY = os.getenv("BOT_DISPLAY", "MAESTRO ANACLETO")
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+BOT_USERNAME = (os.getenv("BOT_USERNAME", "MaestroAnacletoBot") or "MaestroAnacletoBot").lstrip("@").strip()
+ALLOWED_GROUP_ID_RAW = (os.getenv("ALLOWED_GROUP_ID") or "").strip()
+TZ_NAME = (os.getenv("TZ", "Europe/Rome") or "Europe/Rome").strip()
+BOT_DISPLAY = (os.getenv("BOT_DISPLAY", "MAESTRO ANACLETO") or "MAESTRO ANACLETO").strip()
+
+PDF_DIR_ENV = (os.getenv("PDF_DIR") or "data/pdfs").strip()
 
 ALLOWED_GROUP_ID: Optional[int] = None
 if ALLOWED_GROUP_ID_RAW:
     try:
         ALLOWED_GROUP_ID = int(ALLOWED_GROUP_ID_RAW)
     except ValueError:
-        raise RuntimeError("ALLOWED_GROUP_ID nel .env deve essere un intero (es: -1001234567890)")
+        raise RuntimeError("ALLOWED_GROUP_ID deve essere un intero (es: -1001234567890)")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN mancante. Mettilo nelle env vars di Render o nel .env locale.")
 
 
-# ===================== TIME / WINDOWS =====================
+# ===================== UTIL TIME / STYLE =====================
 def mention_token() -> str:
     return f"@{BOT_USERNAME}"
 
 
+def now_local() -> dt.datetime:
+    return dt.datetime.now()
+
+
 def is_night_now() -> bool:
-    h = dt.datetime.now().hour
+    h = now_local().hour
     return h >= 23 or h < 7
 
 
@@ -75,7 +87,7 @@ def day_intro(user_first: str) -> str:
 
 
 def random_time_today_window(start_hm: Tuple[int, int], end_hm: Tuple[int, int]) -> dt.datetime:
-    now = dt.datetime.now()
+    now = now_local()
     start = now.replace(hour=start_hm[0], minute=start_hm[1], second=0, microsecond=0)
     end = now.replace(hour=end_hm[0], minute=end_hm[1], second=0, microsecond=0)
     delta = int((end - start).total_seconds())
@@ -88,7 +100,7 @@ def random_time_night_window() -> dt.datetime:
     """
     Finestra: 23:00–00:45 (attraversa mezzanotte)
     """
-    now = dt.datetime.now()
+    now = now_local()
     today_2300 = now.replace(hour=23, minute=0, second=0, microsecond=0)
     today_235959 = now.replace(hour=23, minute=59, second=59, microsecond=0)
 
@@ -139,7 +151,7 @@ LOCAL_QUOTES: List[Quote] = [
 async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
     api = "https://it.wikiquote.org/w/api.php"
     try:
-        async with httpx.AsyncClient(headers={"User-Agent": "MaestroAnacletoBot/1.0"}) as client:
+        async with httpx.AsyncClient(headers={"User-Agent": "MaestroAncletoBot/1.0"}) as client:
             r = await client.get(
                 api,
                 params={
@@ -211,6 +223,14 @@ async def get_random_quote() -> Quote:
     return random.choice(LOCAL_QUOTES)
 
 
+def fmt_quote_html(q: Quote) -> str:
+    a = html.escape(q.author)
+    t = html.escape(q.text)
+    s = html.escape(q.source)
+    r = html.escape(q.ref)
+    return f"📜 <b>{a}</b>\n“{t}”\n\nFonte: {s}\n{r}"
+
+
 # ===================== GROUP LOCK / FILTERS =====================
 def in_allowed_context(update: Update) -> bool:
     if not update.effective_chat:
@@ -218,7 +238,6 @@ def in_allowed_context(update: Update) -> bool:
 
     chat = update.effective_chat
 
-    # Privato ok (test). Se vuoi lo chiudiamo dopo.
     if chat.type == ChatType.PRIVATE:
         return True
 
@@ -264,7 +283,87 @@ def is_bot_mentioned(msg) -> bool:
     return False
 
 
-# ===================== SCHEDULED MESSAGES (PTB JobQueue) =====================
+# ===================== PDF RAG (lite, offline) =====================
+@dataclass
+class PageChunk:
+    book: str
+    page: int  # 1-based
+    text: str
+
+
+PDF_INDEX: List[PageChunk] = []
+PDF_BOOKS: List[str] = []
+
+
+def _normalize(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def load_pdfs(pdf_dir: str) -> Tuple[List[PageChunk], List[str]]:
+    root = Path(__file__).resolve().parent
+    d = (root / pdf_dir).resolve()
+
+    if not d.exists():
+        log.warning("PDF dir NON trovato: %s", d)
+        return [], []
+
+    pdfs = sorted([p for p in d.glob("*.pdf") if p.is_file()])
+    if not pdfs:
+        log.warning("PDF dir trovato ma vuoto: %s", d)
+        return [], []
+
+    pages: List[PageChunk] = []
+    books: List[str] = []
+
+    log.info("PDF scan: dir=%s | files=%s", d, len(pdfs))
+    for p in pdfs:
+        try:
+            reader = PdfReader(str(p))
+            books.append(p.name)
+            for i, page in enumerate(reader.pages, start=1):
+                txt = page.extract_text() or ""
+                txt = txt.strip()
+                if not txt:
+                    continue
+                pages.append(PageChunk(book=p.name, page=i, text=txt))
+        except Exception as e:
+            log.exception("PDF parse fail: %s | err=%s", p.name, e)
+
+    return pages, books
+
+
+def search_pdf(question: str, k: int = 3) -> List[PageChunk]:
+    q = _normalize(question)
+    if not q or not PDF_INDEX:
+        return []
+
+    tokens = [t for t in re.split(r"[^a-zàèéìòù0-9]+", q) if len(t) >= 3]
+    if not tokens:
+        return []
+
+    scored: List[Tuple[int, PageChunk]] = []
+    for ch in PDF_INDEX:
+        t = _normalize(ch.text)
+        score = 0
+        for tok in tokens:
+            score += t.count(tok)
+        if score > 0:
+            scored.append((score, ch))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:k]]
+
+
+def clip(text: str, max_chars: int = 600) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+# ===================== SCHEDULED MESSAGES =====================
 async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_GROUP_ID is None:
         return
@@ -272,14 +371,12 @@ async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
     text = (
         "☀️ Buongiorno, Metavoice.\n"
         "Lo so… è mattina. Anche per me è un trauma.\n\n"
-        f"📜 *{q.author}*\n"
-        f"“{q.text}”\n\n"
-        f"Fonte: {q.source}\n{q.ref}"
+        + fmt_quote_html(q)
     )
     await context.bot.send_message(
         chat_id=ALLOWED_GROUP_ID,
         text=text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
@@ -291,37 +388,26 @@ async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🌙 Buonanotte, Metavoice.\n"
         "Se è fatta na certa… io mi ritiro nel mio piano dimensionale.\n\n"
-        f"📜 *{q.author}*\n"
-        f"“{q.text}”\n\n"
-        f"Fonte: {q.source}\n{q.ref}"
+        + fmt_quote_html(q)
     )
     await context.bot.send_message(
         chat_id=ALLOWED_GROUP_ID,
         text=text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
 
 def plan_today_jobs(application):
-    """
-    Pianifica ogni giorno:
-    - buongiorno random 08:00–09:00
-    - buonanotte random 23:00–00:45
-    """
     if ALLOWED_GROUP_ID is None:
         log.warning("ALLOWED_GROUP_ID non impostato: non pianifico buongiorno/buonanotte.")
         return
 
     if application.job_queue is None:
-        log.error(
-            "JobQueue non disponibile (application.job_queue=None). "
-            "Installa python-telegram-bot con extra [job-queue] e apscheduler."
-        )
+        log.error("JobQueue non disponibile (application.job_queue=None).")
         return
 
-    now = dt.datetime.now()
-
+    now = now_local()
     gm_time = random_time_today_window((8, 0), (9, 0))
     gn_time = random_time_night_window()
 
@@ -330,7 +416,6 @@ def plan_today_jobs(application):
     if gn_time <= now:
         gn_time = now + dt.timedelta(minutes=3)
 
-    # Rimuovi job vecchi
     for name in ("good_morning", "good_night"):
         old = application.job_queue.get_jobs_by_name(name)
         for j in old:
@@ -338,7 +423,6 @@ def plan_today_jobs(application):
 
     application.job_queue.run_once(send_good_morning, when=gm_time, name="good_morning")
     application.job_queue.run_once(send_good_night, when=gn_time, name="good_night")
-
     log.info("Pianificato buongiorno: %s | buonanotte: %s", gm_time, gn_time)
 
 
@@ -351,24 +435,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
     await update.message.reply_text(
-        f"Sono *{BOT_DISPLAY}* 🕯️\n\n"
+        f"Sono <b>{html.escape(BOT_DISPLAY)}</b> 🕯️\n\n"
         "✅ In gruppo rispondo solo se mi menzioni o mi fai reply.\n"
         "✅ Buongiorno random 08:00–09:00 e buonanotte random 23:00–00:45.\n\n"
         "Comandi:\n"
         "• /ping\n"
         "• /status\n"
-        "• /ask <domanda>\n"
+        "• /sources\n"
+        "• /ask &lt;domanda&gt;\n"
         "• /quote\n"
         "• /test_gm\n"
         "• /test_gn\n",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
-    await update.message.reply_text("🏓 Pong. Render non dorme. Io quasi.")
+    await update.message.reply_text("🏓 Pong. Io quasi dormivo.")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -376,15 +461,35 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lock = f"🔒 ALLOWED_GROUP_ID={ALLOWED_GROUP_ID}" if ALLOWED_GROUP_ID is not None else "🔓 ALLOWED_GROUP_ID non impostato"
-    jq = "✅" if (context.application.job_queue is not None) else "❌ (manca extra [job-queue])"
+    jq = "✅" if (context.application.job_queue is not None) else "❌"
+    pdfs = f"✅ {len(PDF_BOOKS)} libri / {len(PDF_INDEX)} pagine" if PDF_BOOKS else "❌ (nessun PDF caricato)"
 
     await update.message.reply_text(
-        "📌 Status\n"
-        f"• Username: {mention_token()}\n"
-        f"• {lock}\n"
+        "📌 <b>Status</b>\n"
+        f"• Username: {html.escape(mention_token())}\n"
+        f"• {html.escape(lock)}\n"
         f"• JobQueue: {jq}\n"
-        "• Quote: ✅ (Wikiquote + fallback)\n"
-        "• RAG PDF: ❌ (prossimo step)\n"
+        f"• PDF: {html.escape(pdfs)}\n"
+        "• Quote: ✅ (Wikiquote + fallback)\n",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_allowed_context(update):
+        return
+    if not PDF_BOOKS:
+        await update.message.reply_text(
+            "📚 <b>Libri CF77</b>\nNessun PDF trovato in <code>data/pdfs</code>.\n"
+            "Mettili lì e fai push su GitHub, poi Render redeploya.",
+            parse_mode="HTML",
+        )
+        return
+
+    items = "\n".join([f"• {html.escape(name)}" for name in PDF_BOOKS])
+    await update.message.reply_text(
+        "📚 <b>Libri CF77 caricati</b>\n" + items,
+        parse_mode="HTML",
     )
 
 
@@ -393,10 +498,8 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     q = await get_random_quote()
     await update.message.reply_text(
-        f"📜 *{q.author}*\n"
-        f"“{q.text}”\n\n"
-        f"Fonte: {q.source}\n{q.ref}",
-        parse_mode="Markdown",
+        fmt_quote_html(q),
+        parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
@@ -409,13 +512,26 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not question:
         await update.message.reply_text("Usa: /ask <domanda>")
         return
+
     intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-    await update.message.reply_text(
-        intro
-        + "📌 Domanda ricevuta:\n"
-        + question
-        + "\n\n🧠 Risposta (test): presto consulterò i testi del Cerchio Firenze 77 e citerò libro+pagina."
-    )
+
+    hits = search_pdf(question, k=3)
+    if not hits:
+        await update.message.reply_text(
+            intro
+            + "📌 Domanda ricevuta:\n"
+            + question
+            + "\n\n😤 Non ho trovato un passaggio chiaro nei PDF che ho indicizzato.\n"
+              "Prova a riformulare con parole chiave più specifiche (es: “piano astrale”, “corpo astrale”, “trapasso”)."
+        )
+        return
+
+    parts = [intro + "📌 " + question + "\n\n<b>Riscontri dai testi:</b>\n"]
+    for ch in hits:
+        snippet = html.escape(clip(ch.text, 650))
+        parts.append(f"\n<b>{html.escape(ch.book)}</b> — pag. {ch.page}\n“{snippet}”\n")
+
+    await update.message.reply_text("".join(parts), parse_mode="HTML")
 
 
 async def cmd_test_gm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,38 +561,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info("MSG | chat_type=%s chat_id=%s user=%s text=%s", chat.type, chat.id, user_first, text[:120])
 
+    # In privato: rispondi sempre
     if chat.type == ChatType.PRIVATE:
         intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-        await msg.reply_text(intro + "Dimmi pure. (privato: test)")
+        await msg.reply_text(intro + "Dimmi pure. (privato)")
         return
 
+    # In gruppo: solo se menzionato o reply
     if not is_bot_mentioned(msg):
         return
 
     intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-    await msg.reply_text(intro + "Ok, ti sento. (RAG PDF a breve) 😈")
+    await msg.reply_text(intro + "Ok, ti sento. Usa /ask <domanda> 😈")
 
 
 # ===================== ERROR HANDLER =====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
-        log.error("CONFLICT: Un'altra istanza del bot sta facendo polling. Chiudine una.")
+        log.error(
+            "CONFLICT: Un'altra istanza sta facendo polling. "
+            "Controlla Render: deve esserci UN SOLO servizio Anacleto attivo."
+        )
     else:
         log.exception("Errore non gestito:", exc_info=err)
 
 
 # ===================== STARTUP HOOK =====================
 async def post_init(application):
-    # Pianifica subito all'avvio
+    global PDF_INDEX, PDF_BOOKS
+    PDF_INDEX, PDF_BOOKS = load_pdfs(PDF_DIR_ENV)
+
+    if PDF_BOOKS:
+        log.info("CF77 PDF pronto. books=%s pages=%s dir=%s", len(PDF_BOOKS), len(PDF_INDEX), PDF_DIR_ENV)
+    else:
+        log.warning("CF77 PDF NON pronto. books=0 pages=0 dir=%s", PDF_DIR_ENV)
+
     plan_today_jobs(application)
 
-    # Pianifica ripianificazione giornaliera alle 00:05
     if application.job_queue is None:
         log.error("JobQueue assente: impossibile schedulare daily planner.")
         return
 
-    now = dt.datetime.now()
+    now = now_local()
     next_run = now.replace(hour=0, minute=5, second=0, microsecond=0)
     if next_run <= now:
         next_run = next_run + dt.timedelta(days=1)
@@ -490,7 +617,7 @@ async def post_init(application):
     log.info("Daily planner schedulato per: %s", next_run)
 
 
-def build_application():
+def main():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_error_handler(on_error)
@@ -498,36 +625,16 @@ def build_application():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("test_gm", cmd_test_gm))
     app.add_handler(CommandHandler("test_gn", cmd_test_gn))
 
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
-    return app
-
-
-def run_polling_blocking():
-    """
-    Versione safe per Render quando viene lanciata in un thread:
-    - crea e setta un event loop nel thread
-    - disabilita i signal handlers (stop_signals=None) perché nei thread non si possono usare
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = build_application()
 
     print(f"{BOT_DISPLAY} è in ascolto…")
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=None,   # <- CRUCIALE: evita set_wakeup_fd / signal handlers
-    )
-
-
-def main():
-    # locale (se lo lanci diretto): va benissimo
-    run_polling_blocking()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
