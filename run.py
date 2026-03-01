@@ -1,52 +1,92 @@
 import asyncio
+import hashlib
 import logging
 import os
 import signal
+import socket
 import sys
+import time
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("RUNNER")
-
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TRADING_DIR = os.path.join(BASE_DIR, "tradingbotpaper")
 
-# Rende importabile "core" (che sta in tradingbotpaper/core)
-# così "from core.xxx import yyy" funziona anche su Render.
+# Rende importabile "core" (tradingbotpaper/core)
 if TRADING_DIR not in sys.path:
     sys.path.insert(0, TRADING_DIR)
 
 
-async def start_anacleto():
-    # anacleto_bot.py deve esporre: async def run_anacleto()
-    from anacleto_bot import run_anacleto
-    await run_anacleto()
+def _short_hash(s: str) -> str:
+    if not s:
+        return "none"
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:10]
+
+
+def log_identity():
+    pid = os.getpid()
+    host = socket.gethostname()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Render spesso espone queste env (non sempre)
+    render_service = os.getenv("RENDER_SERVICE_NAME", "")
+    render_instance = os.getenv("RENDER_INSTANCE_ID", "")
+    bot_token = os.getenv("BOT_TOKEN", "")
+    token_fpr = _short_hash(bot_token)
+
+    log.info("==============================================")
+    log.info("RUNNER START | %s", now)
+    log.info("PID=%s | HOST=%s", pid, host)
+    if render_service or render_instance:
+        log.info("RENDER_SERVICE_NAME=%s | RENDER_INSTANCE_ID=%s", render_service, render_instance)
+    log.info("BOT_TOKEN_FPR=%s (sha256[:10])", token_fpr)
+    log.info("TRADING_DIR in sys.path=%s", TRADING_DIR in sys.path)
+    log.info("==============================================")
+
+
+async def anacleto_supervisor():
+    """
+    Avvia Anacleto (async). Se crasha, riprova.
+    """
+    while True:
+        try:
+            from anacleto_bot import run_anacleto
+            log.info("ANACLETO: avvio…")
+            await run_anacleto()
+            log.warning("ANACLETO: terminato (strano). Riavvio tra 10s…")
+            await asyncio.sleep(10)
+        except Exception as e:
+            log.exception("ANACLETO: crash. Riprovo tra 30s…", exc_info=e)
+            await asyncio.sleep(30)
 
 
 async def kraken_supervisor():
     """
-    Avvia Kraken in un thread (bot sync e bloccante).
-    Se crasha, non abbatte tutto: aspetta e riprova.
+    Avvia Kraken in thread (sync). Se crasha, riprova.
     """
     while True:
         try:
             from tradingbotpaper.bot import run_kraken_sync
             cfg_path = os.path.join("tradingbotpaper", "config.yaml")
-            log.info("Avvio Kraken bot con config: %s", cfg_path)
+            log.info("KRAKEN: avvio con config=%s", cfg_path)
             await asyncio.to_thread(run_kraken_sync, cfg_path)
-            # Se run_kraken_sync termina "normalmente" (strano), riparti comunque
-            log.warning("Kraken bot terminato. Riavvio tra 10s...")
+            log.warning("KRAKEN: terminato. Riavvio tra 10s…")
             await asyncio.sleep(10)
         except Exception as e:
-            log.exception("Kraken bot crashato. Riprovo tra 30s...", exc_info=e)
+            log.exception("KRAKEN: crash. Riprovo tra 30s…", exc_info=e)
             await asyncio.sleep(30)
 
 
 async def main():
+    log_identity()
+
     stop_event = asyncio.Event()
 
     def _stop(*_):
-        log.info("Stop richiesto. Chiudo tutto...")
+        log.info("STOP: ricevuto SIGTERM/SIGINT. Spengo…")
         stop_event.set()
 
     for s in (signal.SIGTERM, signal.SIGINT):
@@ -55,31 +95,16 @@ async def main():
         except Exception:
             pass
 
-    anacleto_task = asyncio.create_task(start_anacleto(), name="anacleto")
-    kraken_task = asyncio.create_task(kraken_supervisor(), name="kraken_supervisor")
-    stop_task = asyncio.create_task(stop_event.wait(), name="stop")
+    t_anacleto = asyncio.create_task(anacleto_supervisor(), name="anacleto_supervisor")
+    t_kraken = asyncio.create_task(kraken_supervisor(), name="kraken_supervisor")
 
-    # Aspetta stop (Render shutdown) o fine Anacleto (non dovrebbe finire mai)
-    done, pending = await asyncio.wait(
-        [anacleto_task, stop_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    await stop_event.wait()
 
-    # Se Anacleto muore con errore, lo logghiamo
-    for t in done:
-        if t.get_name() == "anacleto":
-            exc = t.exception()
-            if exc:
-                log.exception("Anacleto morto con errore:", exc_info=exc)
-
-    # Chiudiamo Kraken supervisor
-    kraken_task.cancel()
-    await asyncio.gather(kraken_task, return_exceptions=True)
-
-    # Cancella eventuali pending (stop_task ecc.)
-    for t in pending:
+    for t in (t_anacleto, t_kraken):
         t.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)
+    await asyncio.gather(t_anacleto, t_kraken, return_exceptions=True)
+
+    log.info("STOP: completo.")
 
 
 if __name__ == "__main__":
