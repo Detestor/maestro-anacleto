@@ -5,7 +5,6 @@ import logging
 import random
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
-from pathlib import Path
 
 from dotenv import load_dotenv
 import httpx
@@ -21,7 +20,6 @@ from telegram.ext import (
 )
 from telegram.error import Conflict
 
-from rag_cf77 import CF77Rag
 
 # ===================== LOGGING =====================
 logging.basicConfig(
@@ -32,6 +30,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.INFO)
 log = logging.getLogger("ANACLETO")
 
+
 # ===================== ENV =====================
 load_dotenv()
 
@@ -40,9 +39,6 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "MaestroAnacletoBot").lstrip("@")
 ALLOWED_GROUP_ID_RAW = os.getenv("ALLOWED_GROUP_ID", "").strip()
 TZ_NAME = os.getenv("TZ", "Europe/Rome")
 BOT_DISPLAY = os.getenv("BOT_DISPLAY", "MAESTRO ANACLETO")
-
-# PDF dir configurabile; default: "<repo_root>/data/pdfs"
-PDF_DIR_ENV = os.getenv("CF77_PDF_DIR", "").strip()
 
 ALLOWED_GROUP_ID: Optional[int] = None
 if ALLOWED_GROUP_ID_RAW:
@@ -54,13 +50,16 @@ if ALLOWED_GROUP_ID_RAW:
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN mancante. Mettilo nelle env vars di Render o nel .env locale.")
 
+
 # ===================== TIME / WINDOWS =====================
 def mention_token() -> str:
     return f"@{BOT_USERNAME}"
 
+
 def is_night_now() -> bool:
     h = dt.datetime.now().hour
     return h >= 23 or h < 7
+
 
 def night_intro(user_first: str) -> str:
     intros = [
@@ -70,8 +69,10 @@ def night_intro(user_first: str) -> str:
     ]
     return random.choice(intros)
 
+
 def day_intro(user_first: str) -> str:
     return f"Salve, @{user_first}. Hai chiamato il {BOT_DISPLAY}. 📚\n"
+
 
 def random_time_today_window(start_hm: Tuple[int, int], end_hm: Tuple[int, int]) -> dt.datetime:
     now = dt.datetime.now()
@@ -82,7 +83,11 @@ def random_time_today_window(start_hm: Tuple[int, int], end_hm: Tuple[int, int])
         return start
     return start + dt.timedelta(seconds=random.randint(0, delta))
 
+
 def random_time_night_window() -> dt.datetime:
+    """
+    Finestra: 23:00–00:45 (attraversa mezzanotte)
+    """
     now = dt.datetime.now()
     today_2300 = now.replace(hour=23, minute=0, second=0, microsecond=0)
     today_235959 = now.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -98,6 +103,7 @@ def random_time_night_window() -> dt.datetime:
         delta = int((tomorrow_0045 - tomorrow_0000).total_seconds())
         return tomorrow_0000 + dt.timedelta(seconds=random.randint(0, max(delta, 1)))
 
+
 # ===================== QUOTES =====================
 @dataclass
 class Quote:
@@ -105,6 +111,7 @@ class Quote:
     text: str
     source: str
     ref: str
+
 
 QUOTE_AUTHORS = [
     "Allan Kardec",
@@ -128,13 +135,20 @@ LOCAL_QUOTES: List[Quote] = [
     Quote("Platone", "La conoscenza è il nutrimento dell’anima.", "Local", "attrib."),
 ]
 
+
 async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
     api = "https://it.wikiquote.org/w/api.php"
     try:
         async with httpx.AsyncClient(headers={"User-Agent": "MaestroAnacletoBot/1.0"}) as client:
             r = await client.get(
                 api,
-                params={"format":"json","action":"query","list":"search","srsearch":author,"srlimit":1},
+                params={
+                    "format": "json",
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": author,
+                    "srlimit": 1,
+                },
                 timeout=10,
             )
             r.raise_for_status()
@@ -147,7 +161,14 @@ async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
 
             r2 = await client.get(
                 api,
-                params={"format":"json","action":"query","prop":"extracts","explaintext":1,"exsectionformat":"plain","titles":title},
+                params={
+                    "format": "json",
+                    "action": "query",
+                    "prop": "extracts",
+                    "explaintext": 1,
+                    "exsectionformat": "plain",
+                    "titles": title,
+                },
                 timeout=10,
             )
             r2.raise_for_status()
@@ -177,8 +198,10 @@ async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
             text = random.choice(candidates)
             url = f"https://it.wikiquote.org/wiki/{title.replace(' ', '_')}"
             return Quote(author=title, text=text, source="Wikiquote", ref=url)
+
     except Exception:
         return None
+
 
 async def get_random_quote() -> Quote:
     author = random.choice(QUOTE_AUTHORS)
@@ -187,16 +210,23 @@ async def get_random_quote() -> Quote:
         return q
     return random.choice(LOCAL_QUOTES)
 
+
 # ===================== GROUP LOCK / FILTERS =====================
 def in_allowed_context(update: Update) -> bool:
     if not update.effective_chat:
         return False
+
     chat = update.effective_chat
+
+    # Privato ok (test). Se vuoi lo chiudiamo dopo.
     if chat.type == ChatType.PRIVATE:
         return True
+
     if ALLOWED_GROUP_ID is None:
         return True
+
     return chat.id == ALLOWED_GROUP_ID
+
 
 def is_reply_to_bot(msg) -> bool:
     try:
@@ -207,15 +237,20 @@ def is_reply_to_bot(msg) -> bool:
         pass
     return False
 
+
 def is_bot_mentioned(msg) -> bool:
     if not msg:
         return False
+
     if is_reply_to_bot(msg):
         return True
+
     text = msg.text or ""
     target = mention_token().lower()
+
     if target in text.lower():
         return True
+
     entities = msg.entities or []
     for ent in entities:
         if ent.type == "mention":
@@ -225,61 +260,11 @@ def is_bot_mentioned(msg) -> bool:
         if ent.type == "text_mention" and ent.user:
             if (ent.user.username or "").lower() == BOT_USERNAME.lower():
                 return True
+
     return False
 
-# ===================== CF77 RAG INIT =====================
-RAG: Optional[CF77Rag] = None
-RAG_BOOKS = 0
-RAG_PAGES = 0
-RAG_DIR_STR = ""
 
-def init_rag():
-    global RAG, RAG_BOOKS, RAG_PAGES, RAG_DIR_STR
-
-    # repo root = directory dove sta questo file (src/)
-    here = Path(__file__).resolve().parent
-    default_dir = (here / "data" / "pdfs").resolve()
-
-    pdf_dir = Path(PDF_DIR_ENV).expanduser().resolve() if PDF_DIR_ENV else default_dir
-    RAG_DIR_STR = str(pdf_dir)
-
-    rag = CF77Rag(pdf_dir=pdf_dir)
-    books, pages = rag.build()
-
-    RAG = rag
-    RAG_BOOKS = books
-    RAG_PAGES = pages
-
-    log.info("CF77 RAG pronto. books=%s pages=%s dir=%s", books, pages, pdf_dir)
-
-def rag_answer(question: str, top_k: int = 4) -> str:
-    if not RAG or RAG_BOOKS == 0 or RAG_PAGES == 0:
-        return (
-            "🧠 RAG CF77 non pronto (PDF non trovati o vuoti).\n"
-            f"📁 Dir attesa: {RAG_DIR_STR}\n"
-            "Tip: controlla che i PDF siano presenti su Render nel path indicato."
-        )
-
-    hits = RAG.query(question, top_k=top_k)
-    if not hits:
-        return "Non trovo un passaggio chiaro nei testi (o la domanda è troppo generica). Prova a riformulare."
-
-    # mini-sintesi + estratti
-    out = []
-    out.append("📚 *Secondo i testi del Cerchio Firenze 77:*")
-    out.append("")
-
-    for h in hits:
-        snippet = h.text.strip().replace("\n", " ")
-        if len(snippet) > 450:
-            snippet = snippet[:450].rstrip() + "…"
-        out.append(f"— _{h.book}_, p.{h.page}")
-        out.append(f"“{snippet}”")
-        out.append("")
-
-    return "\n".join(out)
-
-# ===================== SCHEDULED MESSAGES =====================
+# ===================== SCHEDULED MESSAGES (PTB JobQueue) =====================
 async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_GROUP_ID is None:
         return
@@ -297,6 +282,7 @@ async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         disable_web_page_preview=True,
     )
+
 
 async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
     if ALLOWED_GROUP_ID is None:
@@ -316,12 +302,22 @@ async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+
 def plan_today_jobs(application):
+    """
+    Pianifica ogni giorno:
+    - buongiorno random 08:00–09:00
+    - buonanotte random 23:00–00:45
+    """
     if ALLOWED_GROUP_ID is None:
         log.warning("ALLOWED_GROUP_ID non impostato: non pianifico buongiorno/buonanotte.")
         return
+
     if application.job_queue is None:
-        log.error("JobQueue non disponibile: manca extra [job-queue].")
+        log.error(
+            "JobQueue non disponibile (application.job_queue=None). "
+            "Installa python-telegram-bot con extra [job-queue] e apscheduler."
+        )
         return
 
     now = dt.datetime.now()
@@ -329,16 +325,12 @@ def plan_today_jobs(application):
     gm_time = random_time_today_window((8, 0), (9, 0))
     gn_time = random_time_night_window()
 
-    # se siamo già oltre le 10:00, il buongiorno si fa domani
-    if now.hour >= 10:
-        gm_time = (now + dt.timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
-        gm_time = random_time_today_window((8, 0), (9, 0))
-
     if gm_time <= now:
         gm_time = now + dt.timedelta(minutes=2)
     if gn_time <= now:
         gn_time = now + dt.timedelta(minutes=3)
 
+    # Rimuovi job vecchi
     for name in ("good_morning", "good_night"):
         old = application.job_queue.get_jobs_by_name(name)
         for j in old:
@@ -346,10 +338,13 @@ def plan_today_jobs(application):
 
     application.job_queue.run_once(send_good_morning, when=gm_time, name="good_morning")
     application.job_queue.run_once(send_good_night, when=gn_time, name="good_night")
+
     log.info("Pianificato buongiorno: %s | buonanotte: %s", gm_time, gn_time)
+
 
 async def daily_planner(context: ContextTypes.DEFAULT_TYPE):
     plan_today_jobs(context.application)
+
 
 # ===================== COMMANDS =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -363,33 +358,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /ping\n"
         "• /status\n"
         "• /ask <domanda>\n"
-        "• /cf77 <domanda>\n"
         "• /quote\n"
         "• /test_gm\n"
         "• /test_gn\n",
         parse_mode="Markdown",
     )
 
+
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
     await update.message.reply_text("🏓 Pong. Render non dorme. Io quasi.")
 
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
+
     lock = f"🔒 ALLOWED_GROUP_ID={ALLOWED_GROUP_ID}" if ALLOWED_GROUP_ID is not None else "🔓 ALLOWED_GROUP_ID non impostato"
     jq = "✅" if (context.application.job_queue is not None) else "❌ (manca extra [job-queue])"
-    rag_ok = "✅" if (RAG_BOOKS > 0 and RAG_PAGES > 0) else "❌"
+
     await update.message.reply_text(
         "📌 Status\n"
         f"• Username: {mention_token()}\n"
         f"• {lock}\n"
         f"• JobQueue: {jq}\n"
-        f"• RAG CF77: {rag_ok} (books={RAG_BOOKS} pages={RAG_PAGES})\n"
-        f"• PDF dir: {RAG_DIR_STR}\n"
         "• Quote: ✅ (Wikiquote + fallback)\n"
+        "• RAG PDF: ❌ (prossimo step)\n"
     )
+
 
 async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
@@ -403,6 +400,7 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         disable_web_page_preview=True,
     )
 
+
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
@@ -412,31 +410,31 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usa: /ask <domanda>")
         return
     intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-    await update.message.reply_text(intro + "📌 Domanda ricevuta:\n" + question + "\n\n🧠 (usa /cf77 per risposta dai libri)")
+    await update.message.reply_text(
+        intro
+        + "📌 Domanda ricevuta:\n"
+        + question
+        + "\n\n🧠 Risposta (test): presto consulterò i testi del Cerchio Firenze 77 e citerò libro+pagina."
+    )
 
-async def cmd_cf77(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
-        return
-    question = " ".join(context.args).strip()
-    if not question:
-        await update.message.reply_text("Usa: /cf77 <domanda>")
-        return
-    await update.message.reply_text(rag_answer(question), parse_mode="Markdown")
 
 async def cmd_test_gm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
     await send_good_morning(context)
 
+
 async def cmd_test_gn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
     await send_good_night(context)
 
+
 # ===================== TEXT HANDLER =====================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
+
     msg = update.message
     if not msg:
         return
@@ -449,14 +447,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if chat.type == ChatType.PRIVATE:
         intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-        await msg.reply_text(intro + "Dimmi pure. (privato: ok)")
+        await msg.reply_text(intro + "Dimmi pure. (privato: test)")
         return
 
     if not is_bot_mentioned(msg):
         return
 
     intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-    await msg.reply_text(intro + "Ok, ti sento. Usa /cf77 <domanda> per consultare i libri. 😈")
+    await msg.reply_text(intro + "Ok, ti sento. (RAG PDF a breve) 😈")
+
 
 # ===================== ERROR HANDLER =====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -466,11 +465,13 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     else:
         log.exception("Errore non gestito:", exc_info=err)
 
+
 # ===================== STARTUP HOOK =====================
 async def post_init(application):
-    init_rag()
+    # Pianifica subito all'avvio
     plan_today_jobs(application)
 
+    # Pianifica ripianificazione giornaliera alle 00:05
     if application.job_queue is None:
         log.error("JobQueue assente: impossibile schedulare daily planner.")
         return
@@ -488,28 +489,46 @@ async def post_init(application):
     )
     log.info("Daily planner schedulato per: %s", next_run)
 
-def build_app():
-    return ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
-def run_polling_blocking():
-    app = build_app()
+def build_application():
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+
     app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("ask", cmd_ask))
-    app.add_handler(CommandHandler("cf77", cmd_cf77))
     app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("test_gm", cmd_test_gm))
     app.add_handler(CommandHandler("test_gn", cmd_test_gn))
+
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
+    return app
+
+
+def run_polling_blocking():
+    """
+    Versione safe per Render quando viene lanciata in un thread:
+    - crea e setta un event loop nel thread
+    - disabilita i signal handlers (stop_signals=None) perché nei thread non si possono usare
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app = build_application()
 
     print(f"{BOT_DISPLAY} è in ascolto…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        stop_signals=None,   # <- CRUCIALE: evita set_wakeup_fd / signal handlers
+    )
+
 
 def main():
+    # locale (se lo lanci diretto): va benissimo
     run_polling_blocking()
+
 
 if __name__ == "__main__":
     main()

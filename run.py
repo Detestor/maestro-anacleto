@@ -26,39 +26,22 @@ def ensure_project_root() -> Path:
     return root
 
 
-def run_anacleto_blocking_in_thread():
-    """
-    PTB run_polling() in un thread richiede un event loop ASSOCIATO a quel thread.
-    Quindi lo creiamo e lo settiamo prima di chiamare il bot.
-    """
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
+def run_anacleto_thread_entry():
+    # dentro questo entrypoint, anacleto_bot.py crea il loop e disabilita i segnali
     from anacleto_bot import run_polling_blocking
     run_polling_blocking()
 
 
 async def run_anacleto_supervisor():
-    """
-    Avvia Anacleto (polling) in un thread.
-    Se crasha, riprova con backoff.
-    """
-    from telegram.error import Conflict
-
     backoff = 8
     while True:
         try:
             log.info("ANACLETO: avvio…")
-            await asyncio.to_thread(run_anacleto_blocking_in_thread)
+            await asyncio.to_thread(run_anacleto_thread_entry)
 
             log.warning("ANACLETO: terminato. Riavvio tra 5s…")
             await asyncio.sleep(5)
             backoff = 8
-
-        except Conflict:
-            log.error("ANACLETO: Conflict (altra istanza in polling). Attendo %ss e riprovo…", backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
 
         except Exception as e:
             log.exception("ANACLETO: crash. Riprovo tra %ss… (%s)", backoff, e)
@@ -67,9 +50,6 @@ async def run_anacleto_supervisor():
 
 
 def run_kraken_sync_wrapper(cfg_path: str):
-    """
-    Wrapper sync del Kraken bot (tuo).
-    """
     from tradingbotpaper.bot import run_kraken_sync
     run_kraken_sync(cfg_path)
 
