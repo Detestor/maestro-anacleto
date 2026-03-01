@@ -16,7 +16,7 @@ from core.strategy_trend import trend_signal
 from core.strategy_range import range_signal
 
 
-LOCK_FILE = "bot.lock"
+LOCK_FILE = "/tmp/bot.lock"
 SYMBOL_DEFAULT = "BTC/EUR"
 IN_CRITICAL = False
 
