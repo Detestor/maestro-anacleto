@@ -5,6 +5,7 @@ import time
 import yaml
 import signal
 import sys
+from typing import Optional
 
 from rich import print
 
@@ -16,9 +17,12 @@ from core.strategy_trend import trend_signal
 from core.strategy_range import range_signal
 
 
+# Su Render meglio /tmp (evita lock zombie)
 LOCK_FILE = "/tmp/bot.lock"
 SYMBOL_DEFAULT = "BTC/EUR"
+
 IN_CRITICAL = False
+STOP_REQUESTED = False  # <-- stop flag, no SystemExit quando importato
 
 STATE = {
     "in_pos": False,
@@ -48,7 +52,6 @@ def acquire_lock():
 
         if pid and pid_exists(pid):
             print("[red]Bot già in esecuzione![/red]")
-            # IMPORTANT: non usare sys.exit qui se siamo importati
             raise RuntimeError("Bot già in esecuzione (lock attivo).")
         else:
             try:
@@ -68,7 +71,24 @@ def release_lock():
         pass
 
 
+def request_stop(reason: str = ""):
+    """
+    Richiede stop gentile senza ammazzare il processo (cloud-safe).
+    """
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
+    if reason:
+        try:
+            send_telegram(f"🛑 Stop richiesto: {reason}")
+        except Exception:
+            pass
+
+
 def handle_exit(signum, frame):
+    """
+    Handler segnali SOLO per esecuzione standalone.
+    Se importato (run.py) non registriamo questo handler.
+    """
     global IN_CRITICAL
     if IN_CRITICAL:
         print("\n[yellow]Operazione in corso: ignoro la chiusura. Riprova tra 5 sec.[/yellow]")
@@ -79,23 +99,10 @@ def handle_exit(signum, frame):
         return
 
     print("\n[red]Chiusura controllata...[/red]")
-    try:
-        send_telegram("🛑 Bot chiuso manualmente.")
-    except Exception:
-        pass
+    request_stop("SIGTERM/SIGINT (standalone)")
     release_lock()
-
-    # IMPORTANT: in ambiente importato, evitare sys.exit(0)
+    # In standalone possiamo uscire
     raise SystemExit(0)
-
-
-# Segnali ok anche su Render, ma se gira in thread potrebbe non riceverli:
-# non dà problemi lasciarli; se non arrivano, nessun crash.
-try:
-    signal.signal(signal.SIGINT, handle_exit)
-    signal.signal(signal.SIGTERM, handle_exit)
-except Exception:
-    pass
 
 
 def read_yaml(path: str) -> dict:
@@ -111,15 +118,6 @@ def safe_float(x, default=0.0) -> float:
 
 
 def get_bar_key(df):
-    """
-    Ritorna una chiave "tempo" dell'ultima candela in modo robusto.
-    Supporta:
-    - colonna 'timestamp'
-    - colonna 'ts'
-    - colonna 'datetime'
-    - index datetime/numero
-    - fallback: tuple OHLCV ultima riga
-    """
     cols = list(df.columns)
 
     if "timestamp" in cols:
@@ -143,10 +141,14 @@ def get_bar_key(df):
 
 
 def run_live(cfg: dict):
-    global IN_CRITICAL
+    global IN_CRITICAL, STOP_REQUESTED
 
     acquire_lock()
-    send_telegram("🚀 Bot LIVE (AUTO A/B) avviato. (SL reale + TP software)")
+
+    try:
+        send_telegram("🚀 Bot LIVE (AUTO A/B) avviato. (SL reale + TP software)")
+    except Exception:
+        pass
 
     live_cfg = cfg.get("live", {})
     symbol = str(live_cfg.get("symbol", SYMBOL_DEFAULT))
@@ -175,6 +177,10 @@ def run_live(cfg: dict):
     print(f"spend_pct={spend_pct:.2f} | min_trade_eur={min_trade_eur:.2f}")
 
     while True:
+        if STOP_REQUESTED:
+            print("[yellow]Stop richiesto: esco dal loop LIVE.[/yellow]")
+            break
+
         # ---- balances ----
         bal = ex.fetch_balance()
         eur_free = safe_float(bal.get("free", {}).get("EUR", 0.0))
@@ -184,7 +190,6 @@ def run_live(cfg: dict):
         # ---- ticker ----
         ticker = ex.fetch_ticker(symbol)
         last_price = safe_float(ticker.get("last"), 0.0)
-        bid = safe_float(ticker.get("bid"), last_price)
         ask = safe_float(ticker.get("ask"), last_price)
 
         print(f"LIVE status | price={last_price:.2f} | EUR={eur_free:.2f} | BTC={btc_free:.8f} | tf={timeframe}")
@@ -201,7 +206,10 @@ def run_live(cfg: dict):
                     IN_CRITICAL = False
                 except Exception as e:
                     IN_CRITICAL = False
-                    send_telegram(f"❌ ERRORE TP software sell: {e}")
+                    try:
+                        send_telegram(f"❌ ERRORE TP software sell: {e}")
+                    except Exception:
+                        pass
 
             time.sleep(60)
             continue
@@ -225,16 +233,21 @@ def run_live(cfg: dict):
         # ---- Regime ----
         regime = detect_regime(df)
         if regime != last_regime:
-            send_telegram(f"🧭 Regime: {regime} (tf={timeframe})")
+            try:
+                send_telegram(f"🧭 Regime: {regime} (tf={timeframe})")
+            except Exception:
+                pass
             last_regime = regime
 
-        # se siamo in posizione (e non c'era tp_state) non facciamo altro
         if in_position:
             time.sleep(10)
             continue
 
         if regime == "CHAOS":
-            send_telegram("⛔ CHAOS: nessun trade.")
+            try:
+                send_telegram("⛔ CHAOS: nessun trade.")
+            except Exception:
+                pass
             time.sleep(10)
             continue
 
@@ -256,7 +269,10 @@ def run_live(cfg: dict):
 
         eur_to_spend = min(eur_free * spend_pct, max(0.0, eur_free - 0.5))
         if eur_to_spend < min_trade_eur:
-            send_telegram(f"⚠️ Setup {mode} ma EUR insufficienti (free={eur_free:.2f}).")
+            try:
+                send_telegram(f"⚠️ Setup {mode} ma EUR insufficienti (free={eur_free:.2f}).")
+            except Exception:
+                pass
             time.sleep(10)
             continue
 
@@ -266,7 +282,10 @@ def run_live(cfg: dict):
         df_atr["atr"] = compute_atr(df_atr)
         atr = safe_float(df_atr.iloc[-1]["atr"], 0.0)
         if atr <= 0:
-            send_telegram("⚠️ ATR non valido: skip trade.")
+            try:
+                send_telegram("⚠️ ATR non valido: skip trade.")
+            except Exception:
+                pass
             time.sleep(10)
             continue
 
@@ -277,23 +296,31 @@ def run_live(cfg: dict):
             IN_CRITICAL = True
 
             ex.create_market_buy(symbol, qty_btc)
-            send_telegram(f"🟢 BUY {symbol} ({mode})\nSpesa: {eur_to_spend:.2f}€\nPrezzo: {ask:.2f}")
+            try:
+                send_telegram(f"🟢 BUY {symbol} ({mode})\nSpesa: {eur_to_spend:.2f}€\nPrezzo: {ask:.2f}")
+            except Exception:
+                pass
 
             time.sleep(3)
 
             bal2 = ex.fetch_balance()
             btc_after = safe_float(bal2.get("free", {}).get("BTC", 0.0))
             if btc_after <= 0.00000010:
-                send_telegram("⚠️ BUY fatto ma BTC non visibile nel saldo (attendo).")
+                try:
+                    send_telegram("⚠️ BUY fatto ma BTC non visibile nel saldo (attendo).")
+                except Exception:
+                    pass
                 IN_CRITICAL = False
                 time.sleep(10)
                 continue
 
-            # SOLO SL reale (evita insufficient funds del TP)
             try:
                 ex.create_stop_loss_sell(symbol, btc_after, stop_price)
             except Exception as e:
-                send_telegram(f"❌ ERRORE SL: {e}\nChiudo posizione per sicurezza.")
+                try:
+                    send_telegram(f"❌ ERRORE SL: {e}\nChiudo posizione per sicurezza.")
+                except Exception:
+                    pass
                 ex.create_market_sell(symbol, btc_after)
                 IN_CRITICAL = False
                 time.sleep(10)
@@ -308,33 +335,43 @@ def run_live(cfg: dict):
                 "mode": mode,
             })
 
-            send_telegram(
-                f"🛡 Protezioni {mode}\n"
-                f"ATR: {atr:.2f}\n"
-                f"SL reale: {stop_price:.2f}\n"
-                f"TP software: {tp_price:.2f}"
-            )
+            try:
+                send_telegram(
+                    f"🛡 Protezioni {mode}\n"
+                    f"ATR: {atr:.2f}\n"
+                    f"SL reale: {stop_price:.2f}\n"
+                    f"TP software: {tp_price:.2f}"
+                )
+            except Exception:
+                pass
 
             IN_CRITICAL = False
 
         except Exception as e:
             IN_CRITICAL = False
-            send_telegram(f"❌ ERRORE entry (generico): {e}")
+            try:
+                send_telegram(f"❌ ERRORE entry (generico): {e}")
+            except Exception:
+                pass
 
         time.sleep(10)
 
+    # uscita loop
+    release_lock()
+
 
 def run_kraken_sync(config_path: str = "config.yaml"):
-    """
-    Entry-point IMPORTABILE per Render/run.py.
-    """
     cfg = read_yaml(config_path)
     run_live(cfg)
 
 
 def main():
-    # Manteniamo compatibilità: se lo lanci a mano con `python bot.py`, va.
-    run_kraken_sync("config.yaml")
+    # SOLO in standalone registriamo segnali globali
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
+    cfg = read_yaml("config.yaml")
+    run_live(cfg)
 
 
 if __name__ == "__main__":
