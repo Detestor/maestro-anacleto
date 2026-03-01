@@ -137,17 +137,19 @@ LOCAL_QUOTES: List[Quote] = [
 
 async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
     api = "https://it.wikiquote.org/w/api.php"
-
     try:
         async with httpx.AsyncClient(headers={"User-Agent": "MaestroAnacletoBot/1.0"}) as client:
-            # Search title
-            r = await client.get(api, params={
-                "format": "json",
-                "action": "query",
-                "list": "search",
-                "srsearch": author,
-                "srlimit": 1,
-            }, timeout=10)
+            r = await client.get(
+                api,
+                params={
+                    "format": "json",
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": author,
+                    "srlimit": 1,
+                },
+                timeout=10,
+            )
             r.raise_for_status()
             hits = r.json().get("query", {}).get("search", [])
             if not hits:
@@ -156,15 +158,18 @@ async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
             if not title:
                 return None
 
-            # Extract plaintext
-            r2 = await client.get(api, params={
-                "format": "json",
-                "action": "query",
-                "prop": "extracts",
-                "explaintext": 1,
-                "exsectionformat": "plain",
-                "titles": title,
-            }, timeout=10)
+            r2 = await client.get(
+                api,
+                params={
+                    "format": "json",
+                    "action": "query",
+                    "prop": "extracts",
+                    "explaintext": 1,
+                    "exsectionformat": "plain",
+                    "titles": title,
+                },
+                timeout=10,
+            )
             r2.raise_for_status()
             pages = r2.json().get("query", {}).get("pages", {})
             if not pages:
@@ -248,7 +253,7 @@ def is_bot_mentioned(msg) -> bool:
     entities = msg.entities or []
     for ent in entities:
         if ent.type == "mention":
-            part = text[ent.offset: ent.offset + ent.length].lower()
+            part = text[ent.offset : ent.offset + ent.length].lower()
             if part == target:
                 return True
         if ent.type == "text_mention" and ent.user:
@@ -270,7 +275,12 @@ async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
         f"“{q.text}”\n\n"
         f"Fonte: {q.source}\n{q.ref}"
     )
-    await context.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text, parse_mode="Markdown", disable_web_page_preview=True)
+    await context.bot.send_message(
+        chat_id=ALLOWED_GROUP_ID,
+        text=text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 
 async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
@@ -284,7 +294,12 @@ async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
         f"“{q.text}”\n\n"
         f"Fonte: {q.source}\n{q.ref}"
     )
-    await context.bot.send_message(chat_id=ALLOWED_GROUP_ID, text=text, parse_mode="Markdown", disable_web_page_preview=True)
+    await context.bot.send_message(
+        chat_id=ALLOWED_GROUP_ID,
+        text=text,
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 
 def plan_today_jobs(application):
@@ -292,10 +307,16 @@ def plan_today_jobs(application):
     Pianifica ogni giorno:
     - buongiorno random 08:00–09:00
     - buonanotte random 23:00–00:45
-    Usando JobQueue di python-telegram-bot (super compatibile su Render).
     """
     if ALLOWED_GROUP_ID is None:
         log.warning("ALLOWED_GROUP_ID non impostato: non pianifico buongiorno/buonanotte.")
+        return
+
+    if application.job_queue is None:
+        log.error(
+            "JobQueue non disponibile (application.job_queue=None). "
+            "Installa python-telegram-bot con extra [job-queue] e apscheduler."
+        )
         return
 
     now = dt.datetime.now()
@@ -308,7 +329,7 @@ def plan_today_jobs(application):
     if gn_time <= now:
         gn_time = now + dt.timedelta(minutes=3)
 
-    # Rimuovi job vecchi (se esistono)
+    # Rimuovi job vecchi
     for name in ("good_morning", "good_night"):
         old = application.job_queue.get_jobs_by_name(name)
         for j in old:
@@ -321,9 +342,7 @@ def plan_today_jobs(application):
 
 
 async def daily_planner(context: ContextTypes.DEFAULT_TYPE):
-    # Questo gira ogni giorno a un orario fisso, e pianifica i due messaggi random
-    application = context.application
-    plan_today_jobs(application)
+    plan_today_jobs(context.application)
 
 
 # ===================== COMMANDS =====================
@@ -354,12 +373,15 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
         return
+
     lock = f"🔒 ALLOWED_GROUP_ID={ALLOWED_GROUP_ID}" if ALLOWED_GROUP_ID is not None else "🔓 ALLOWED_GROUP_ID non impostato"
+    jq = "✅" if (context.application.job_queue is not None) else "❌ (manca extra [job-queue])"
+
     await update.message.reply_text(
         "📌 Status\n"
         f"• Username: {mention_token()}\n"
         f"• {lock}\n"
-        "• Scheduler: ✅ (PTB JobQueue)\n"
+        f"• JobQueue: {jq}\n"
         "• Quote: ✅ (Wikiquote + fallback)\n"
         "• RAG PDF: ❌ (prossimo step)\n"
     )
@@ -448,13 +470,22 @@ async def post_init(application):
     # Pianifica subito all'avvio
     plan_today_jobs(application)
 
-    # Pianifica “ripianifica giornaliero” alle 00:05 (ogni giorno)
-    # JobQueue usa secondi dal "now": qui calcoliamo il prossimo 00:05 e poi ripetiamo ogni 24h.
+    # Pianifica ripianificazione giornaliera alle 00:05
+    if application.job_queue is None:
+        log.error("JobQueue assente: impossibile schedulare daily planner.")
+        return
+
     now = dt.datetime.now()
     next_run = now.replace(hour=0, minute=5, second=0, microsecond=0)
     if next_run <= now:
         next_run = next_run + dt.timedelta(days=1)
-    application.job_queue.run_repeating(daily_planner, interval=24 * 60 * 60, first=next_run, name="daily_planner")
+
+    application.job_queue.run_repeating(
+        daily_planner,
+        interval=24 * 60 * 60,
+        first=next_run,
+        name="daily_planner",
+    )
     log.info("Daily planner schedulato per: %s", next_run)
 
 
