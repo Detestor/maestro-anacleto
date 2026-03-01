@@ -2,7 +2,6 @@ import os
 import datetime as dt
 import logging
 import random
-import asyncio
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 
@@ -19,6 +18,18 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import Conflict
+
+# Snapshot Kraken
+try:
+    from shared_state import kraken_snapshot
+except Exception:
+    kraken_snapshot = None
+
+# Notifier Kraken (manda col bot trading notifier: TELEGRAM_TOKEN/CHAT_ID)
+try:
+    from tradingbotpaper.core.notifier import send_telegram as kraken_send_telegram
+except Exception:
+    kraken_send_telegram = None
 
 
 # ===================== LOGGING =====================
@@ -85,9 +96,6 @@ def random_time_today_window(start_hm: Tuple[int, int], end_hm: Tuple[int, int])
 
 
 def random_time_night_window() -> dt.datetime:
-    """
-    Finestra: 23:00–00:45 (attraversa mezzanotte)
-    """
     now = dt.datetime.now()
     today_2300 = now.replace(hour=23, minute=0, second=0, microsecond=0)
     today_235959 = now.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -218,7 +226,6 @@ def in_allowed_context(update: Update) -> bool:
 
     chat = update.effective_chat
 
-    # Privato ok (test). Se vuoi lo chiudiamo dopo.
     if chat.type == ChatType.PRIVATE:
         return True
 
@@ -304,24 +311,15 @@ async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
 
 
 def plan_today_jobs(application):
-    """
-    Pianifica ogni giorno:
-    - buongiorno random 08:00–09:00
-    - buonanotte random 23:00–00:45
-    """
     if ALLOWED_GROUP_ID is None:
         log.warning("ALLOWED_GROUP_ID non impostato: non pianifico buongiorno/buonanotte.")
         return
 
     if application.job_queue is None:
-        log.error(
-            "JobQueue non disponibile (application.job_queue=None). "
-            "Installa python-telegram-bot con extra [job-queue] e apscheduler."
-        )
+        log.error("JobQueue non disponibile (application.job_queue=None).")
         return
 
     now = dt.datetime.now()
-
     gm_time = random_time_today_window((8, 0), (9, 0))
     gn_time = random_time_night_window()
 
@@ -345,6 +343,36 @@ async def daily_planner(context: ContextTypes.DEFAULT_TYPE):
     plan_today_jobs(context.application)
 
 
+# ===================== KRAKEN STATUS HELPERS =====================
+def _fmt_ts(ts: Optional[float]) -> str:
+    if not ts:
+        return "n/a"
+    try:
+        d = dt.datetime.fromtimestamp(float(ts))
+        return d.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def _kraken_text(snapshot: dict) -> str:
+    if not snapshot:
+        return "❌ Nessuno snapshot disponibile."
+    return (
+        "📟 *Kraken LIVE*\n"
+        f"• ts: `{_fmt_ts(snapshot.get('ts'))}`\n"
+        f"• symbol: `{snapshot.get('symbol')}` | tf: `{snapshot.get('timeframe')}`\n"
+        f"• price: `{snapshot.get('price')}`\n"
+        f"• EUR free: `{snapshot.get('eur_free')}`\n"
+        f"• BTC free: `{snapshot.get('btc_free')}`\n"
+        f"• in_position: `{snapshot.get('in_position')}`\n"
+        f"• regime: `{snapshot.get('regime')}`\n"
+        f"• mode: `{snapshot.get('mode')}`\n"
+        f"• TP: `{snapshot.get('tp_price')}` | SL: `{snapshot.get('sl_price')}`\n"
+        f"• last_eval_key: `{snapshot.get('last_eval_key')}`\n"
+        f"• note: `{snapshot.get('note')}`\n"
+    )
+
+
 # ===================== COMMANDS =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
@@ -359,7 +387,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /ask <domanda>\n"
         "• /quote\n"
         "• /test_gm\n"
-        "• /test_gn\n",
+        "• /test_gn\n"
+        "• /kraken_now\n"
+        "• /kraken_last\n"
+        "• /kraken_test\n",
         parse_mode="Markdown",
     )
 
@@ -375,7 +406,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lock = f"🔒 ALLOWED_GROUP_ID={ALLOWED_GROUP_ID}" if ALLOWED_GROUP_ID is not None else "🔓 ALLOWED_GROUP_ID non impostato"
-    jq = "✅" if (context.application.job_queue is not None) else "❌ (manca extra [job-queue])"
+    jq = "✅" if (context.application.job_queue is not None) else "❌"
 
     await update.message.reply_text(
         "📌 Status\n"
@@ -384,6 +415,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• JobQueue: {jq}\n"
         "• Quote: ✅ (Wikiquote + fallback)\n"
         "• RAG PDF: ❌ (prossimo step)\n"
+        "• Kraken dashboard: ✅ (/kraken_now)\n"
     )
 
 
@@ -429,6 +461,41 @@ async def cmd_test_gn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_good_night(context)
 
 
+async def cmd_kraken_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_allowed_context(update):
+        return
+    if not kraken_snapshot:
+        await update.message.reply_text("❌ shared_state non disponibile (file mancante o import fallito).")
+        return
+    snap = kraken_snapshot()
+    await update.message.reply_text(_kraken_text(snap), parse_mode="Markdown")
+
+
+async def cmd_kraken_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_allowed_context(update):
+        return
+    if not kraken_snapshot:
+        await update.message.reply_text("❌ shared_state non disponibile (file mancante o import fallito).")
+        return
+    snap = kraken_snapshot()
+    await update.message.reply_text("🧾 Ultimo snapshot salvato:\n\n" + _kraken_text(snap), parse_mode="Markdown")
+
+
+async def cmd_kraken_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not in_allowed_context(update):
+        return
+    if not kraken_send_telegram:
+        await update.message.reply_text("❌ notifier Kraken non importabile (manca tradingbotpaper/core/notifier.py?).")
+        return
+
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        kraken_send_telegram(f"✅ TEST notifier Kraken OK | {stamp}")
+        await update.message.reply_text("✅ Inviato test al tuo privato (via bot notifier trading).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Test fallito: {e}")
+
+
 # ===================== TEXT HANDLER =====================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not in_allowed_context(update):
@@ -453,20 +520,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-    await msg.reply_text(intro + "Ok, ti sento. (RAG PDF a breve) 😈")
+    await msg.reply_text(intro + "Ok, ti sento. (Kraken dashboard: /kraken_now) 😈")
 
 
 # ===================== ERROR HANDLER =====================
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, Conflict):
-        log.error("CONFLICT: Un'altra istanza del bot sta facendo polling. Chiudine una.")
+        log.error("CONFLICT: Un'altra istanza del bot sta facendo polling. (Token duplicato?)")
     else:
         log.exception("Errore non gestito:", exc_info=err)
 
 
 # ===================== STARTUP HOOK =====================
 async def post_init(application):
+    # “Vaccino” contro webhook/pendenze vecchie
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
     plan_today_jobs(application)
 
     if application.job_queue is None:
@@ -487,7 +560,8 @@ async def post_init(application):
     log.info("Daily planner schedulato per: %s", next_run)
 
 
-def build_application():
+# ===================== RUNNER ENTRY (async) =====================
+async def run_anacleto():
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_error_handler(on_error)
@@ -499,18 +573,11 @@ def build_application():
     app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("test_gm", cmd_test_gm))
     app.add_handler(CommandHandler("test_gn", cmd_test_gn))
+    app.add_handler(CommandHandler("kraken_now", cmd_kraken_now))
+    app.add_handler(CommandHandler("kraken_last", cmd_kraken_last))
+    app.add_handler(CommandHandler("kraken_test", cmd_kraken_test))
 
     app.add_handler(MessageHandler(filters.TEXT, handle_text))
-    return app
-
-
-async def run_anacleto():
-    """
-    Avvio IMPORTABILE (per run.py).
-    Non usa app.run_polling() perché quello gestisce il loop da solo.
-    Qui invece avviamo tutto dentro l'event loop esistente.
-    """
-    app = build_application()
 
     print(f"{BOT_DISPLAY} è in ascolto…")
 
@@ -518,11 +585,10 @@ async def run_anacleto():
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
+    # resta vivo per sempre
     try:
-        # Rimane vivo finché il processo non viene fermato
-        await asyncio.Event().wait()
+        await dt_async_wait_forever()
     finally:
-        # Shutdown pulito
         try:
             await app.updater.stop()
         except Exception:
@@ -537,8 +603,15 @@ async def run_anacleto():
             pass
 
 
+async def dt_async_wait_forever():
+    import asyncio
+    ev = asyncio.Event()
+    await ev.wait()
+
+
+# ===================== Local main (optional) =====================
 def main():
-    # Avvio standalone (se lo lanci a mano)
+    import asyncio
     asyncio.run(run_anacleto())
 
 

@@ -5,7 +5,6 @@ import time
 import yaml
 import signal
 import sys
-from typing import Optional
 
 from rich import print
 
@@ -16,13 +15,18 @@ from core.regime_detector import detect_regime, compute_atr
 from core.strategy_trend import trend_signal
 from core.strategy_range import range_signal
 
+# Telemetria condivisa (root del repo)
+try:
+    from shared_state import kraken_update
+except Exception:
+    kraken_update = None  # fallback
 
-# Su Render meglio /tmp (evita lock zombie)
+
 LOCK_FILE = "/tmp/bot.lock"
 SYMBOL_DEFAULT = "BTC/EUR"
 
 IN_CRITICAL = False
-STOP_REQUESTED = False  # <-- stop flag, no SystemExit quando importato
+STOP_REQUESTED = False
 
 STATE = {
     "in_pos": False,
@@ -72,9 +76,6 @@ def release_lock():
 
 
 def request_stop(reason: str = ""):
-    """
-    Richiede stop gentile senza ammazzare il processo (cloud-safe).
-    """
     global STOP_REQUESTED
     STOP_REQUESTED = True
     if reason:
@@ -85,10 +86,6 @@ def request_stop(reason: str = ""):
 
 
 def handle_exit(signum, frame):
-    """
-    Handler segnali SOLO per esecuzione standalone.
-    Se importato (run.py) non registriamo questo handler.
-    """
     global IN_CRITICAL
     if IN_CRITICAL:
         print("\n[yellow]Operazione in corso: ignoro la chiusura. Riprova tra 5 sec.[/yellow]")
@@ -101,7 +98,6 @@ def handle_exit(signum, frame):
     print("\n[red]Chiusura controllata...[/red]")
     request_stop("SIGTERM/SIGINT (standalone)")
     release_lock()
-    # In standalone possiamo uscire
     raise SystemExit(0)
 
 
@@ -140,6 +136,14 @@ def get_bar_key(df):
     return None
 
 
+def _telemetry(**kwargs):
+    if kraken_update:
+        try:
+            kraken_update(**kwargs)
+        except Exception:
+            pass
+
+
 def run_live(cfg: dict):
     global IN_CRITICAL, STOP_REQUESTED
 
@@ -176,9 +180,12 @@ def run_live(cfg: dict):
     print(f"[bold red]LIVE AUTO bot avviato[/bold red] | {symbol} | tf={timeframe}")
     print(f"spend_pct={spend_pct:.2f} | min_trade_eur={min_trade_eur:.2f}")
 
+    _telemetry(symbol=symbol, timeframe=timeframe, note="Kraken bot started")
+
     while True:
         if STOP_REQUESTED:
             print("[yellow]Stop richiesto: esco dal loop LIVE.[/yellow]")
+            _telemetry(note="Stop requested")
             break
 
         # ---- balances ----
@@ -194,6 +201,16 @@ def run_live(cfg: dict):
 
         print(f"LIVE status | price={last_price:.2f} | EUR={eur_free:.2f} | BTC={btc_free:.8f} | tf={timeframe}")
 
+        _telemetry(
+            price=last_price,
+            eur_free=eur_free,
+            btc_free=btc_free,
+            in_position=in_position,
+            mode=STATE.get("mode"),
+            tp_price=STATE.get("tp_price"),
+            sl_price=STATE.get("sl_price"),
+        )
+
         # ---- Se siamo in posizione: gestiamo TP software ----
         if in_position and STATE["tp_price"] is not None:
             if last_price >= float(STATE["tp_price"]):
@@ -204,6 +221,7 @@ def run_live(cfg: dict):
                     ex.create_market_sell(symbol, qty)
                     STATE.update({"in_pos": False, "entry_price": None, "tp_price": None, "sl_price": None, "qty_btc": None, "mode": None})
                     IN_CRITICAL = False
+                    _telemetry(note="TP hit -> market sell")
                 except Exception as e:
                     IN_CRITICAL = False
                     try:
@@ -219,6 +237,7 @@ def run_live(cfg: dict):
             df = feed.fetch_ohlcv(symbol, timeframe=timeframe, limit=ohlcv_limit)
         except Exception as e:
             print(f"[yellow]Datafeed warning[/yellow] {e}")
+            _telemetry(note=f"Datafeed warning: {e}")
             time.sleep(15)
             continue
 
@@ -229,6 +248,7 @@ def run_live(cfg: dict):
             continue
 
         last_eval_key = current_key
+        _telemetry(last_eval_key=str(current_key))
 
         # ---- Regime ----
         regime = detect_regime(df)
@@ -238,6 +258,7 @@ def run_live(cfg: dict):
             except Exception:
                 pass
             last_regime = regime
+            _telemetry(regime=regime, note="Regime changed")
 
         if in_position:
             time.sleep(10)
@@ -248,6 +269,7 @@ def run_live(cfg: dict):
                 send_telegram("⛔ CHAOS: nessun trade.")
             except Exception:
                 pass
+            _telemetry(note="CHAOS: no trade")
             time.sleep(10)
             continue
 
@@ -264,6 +286,7 @@ def run_live(cfg: dict):
             mode = "B/RANGE"
 
         if sig != "BUY":
+            _telemetry(note=f"No BUY signal (mode={mode})")
             time.sleep(10)
             continue
 
@@ -273,6 +296,7 @@ def run_live(cfg: dict):
                 send_telegram(f"⚠️ Setup {mode} ma EUR insufficienti (free={eur_free:.2f}).")
             except Exception:
                 pass
+            _telemetry(note=f"EUR insufficient for trade (mode={mode})")
             time.sleep(10)
             continue
 
@@ -286,6 +310,7 @@ def run_live(cfg: dict):
                 send_telegram("⚠️ ATR non valido: skip trade.")
             except Exception:
                 pass
+            _telemetry(note="ATR invalid: skip trade")
             time.sleep(10)
             continue
 
@@ -311,6 +336,7 @@ def run_live(cfg: dict):
                 except Exception:
                     pass
                 IN_CRITICAL = False
+                _telemetry(note="BUY done but BTC not visible yet")
                 time.sleep(10)
                 continue
 
@@ -323,6 +349,7 @@ def run_live(cfg: dict):
                     pass
                 ex.create_market_sell(symbol, btc_after)
                 IN_CRITICAL = False
+                _telemetry(note=f"SL error -> closed position: {e}")
                 time.sleep(10)
                 continue
 
@@ -334,6 +361,8 @@ def run_live(cfg: dict):
                 "qty_btc": btc_after,
                 "mode": mode,
             })
+
+            _telemetry(mode=mode, tp_price=tp_price, sl_price=stop_price, note="Position opened with SL real + TP software")
 
             try:
                 send_telegram(
@@ -353,10 +382,10 @@ def run_live(cfg: dict):
                 send_telegram(f"❌ ERRORE entry (generico): {e}")
             except Exception:
                 pass
+            _telemetry(note=f"Entry error: {e}")
 
         time.sleep(10)
 
-    # uscita loop
     release_lock()
 
 
@@ -366,7 +395,6 @@ def run_kraken_sync(config_path: str = "config.yaml"):
 
 
 def main():
-    # SOLO in standalone registriamo segnali globali
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
 
