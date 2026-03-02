@@ -1,84 +1,155 @@
 import os
-import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
+
 from telegram import Update
 
 from anacleto_bot import build_application, BOT_DISPLAY
 
-log = logging.getLogger("ANACLETO_WEB")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+# ----------------------------
+# Logging
+# ----------------------------
+LOG = logging.getLogger("ANACLETO_WEB")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
 
-# --- Helper: URL pubblico del servizio Render ---
-def get_public_base_url() -> str:
-    """
-    Render spesso espone RENDER_EXTERNAL_URL (dipende dal contesto).
-    In alternativa, impostalo tu come env: PUBLIC_BASE_URL
-    """
-    url = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_BASE_URL") or "").strip()
-    if not url:
-        raise RuntimeError(
-            "Manca URL pubblico. Imposta env PUBLIC_BASE_URL = https://<tuo-servizio>.onrender.com"
-        )
-    return url.rstrip("/")
+# ----------------------------
+# Env / Config
+# ----------------------------
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # usata dentro anacleto_bot, qui serve per sanity-check
 
 
-WEBHOOK_PATH = "/telegram"  # endpoint webhook
-application = None  # PTB Application
+def _webhook_url() -> str:
+    if not PUBLIC_BASE_URL:
+        return ""
+    return f"{PUBLIC_BASE_URL}/telegram"
 
 
+# ----------------------------
+# Lifespan (startup/shutdown)
+# ----------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global application
+    """
+    In startup:
+    - costruisce l'application PTB
+    - initialize + start
+    - setWebhook -> /telegram
+    In shutdown:
+    - stop + shutdown
+    """
+    application = None
 
-    # 1) build PTB application
-    application = build_application()
+    try:
+        # Sanity checks
+        if not TELEGRAM_TOKEN:
+            LOG.warning("TELEGRAM_TOKEN non impostato nelle env. Il bot potrebbe non avviarsi.")
+        if not PUBLIC_BASE_URL:
+            LOG.warning("PUBLIC_BASE_URL non impostato: webhook non verrà configurato automaticamente.")
 
-    # 2) initialize + start PTB (NO polling)
-    await application.initialize()
-    await application.start()
+        # Build PTB Application (dal tuo anacleto_bot.py)
+        application = build_application()
+        app.state.tg_app = application
 
-    # 3) set webhook
-    base_url = get_public_base_url()
-    webhook_url = f"{base_url}{WEBHOOK_PATH}"
+        # Start PTB application (senza polling!)
+        await application.initialize()
+        await application.start()
 
-    # Importantissimo: reset webhook e droppa backlog
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    ok = await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+        # Webhook
+        if PUBLIC_BASE_URL:
+            url = _webhook_url()
+            try:
+                r = await application.bot.set_webhook(
+                    url=url,
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=True,  # ripulisce eventuali update vecchi
+                )
+                LOG.info(f"✅ MAESTRO ANACLETO webhook set: {url} | ok={getattr(r, 'to_dict', lambda: r)() if r else r}")
+            except Exception as e:
+                LOG.exception(f"❌ set_webhook fallita: {e}")
 
-    log.info("✅ %s webhook set: %s | ok=%s", BOT_DISPLAY, webhook_url, ok)
+        yield
 
-    yield
+    finally:
+        # Shutdown PTB application
+        try:
+            if application is not None:
+                LOG.info("🧯 shutdown…")
+                await application.stop()
+                await application.shutdown()
+        except Exception as e:
+            LOG.exception(f"Errore in shutdown: {e}")
 
-    # shutdown PTB
-    log.info("🧯 shutdown…")
-    await application.stop()
-    await application.shutdown()
+
+app = FastAPI(title="Maestro Anacleto", lifespan=lifespan)
 
 
-app = FastAPI(lifespan=lifespan)
-
-
+# ----------------------------
+# Routes base
+# ----------------------------
 @app.get("/")
-async def health():
+async def root():
     return {"ok": True, "service": BOT_DISPLAY}
 
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(req: Request):
+@app.get("/health")
+async def health():
     """
-    Riceve update Telegram e lo passa al dispatcher PTB
+    Endpoint per UptimeRobot / ping. Se risponde, Render è sveglio.
     """
-    global application
-    if application is None:
-        return Response(status_code=503, content="Bot not ready")
+    info = {
+        "ok": True,
+        "service": BOT_DISPLAY,
+        "health": "ok",
+        "public_base_url": PUBLIC_BASE_URL or None,
+    }
 
-    data = await req.json()
-    update = Update.de_json(data, application.bot)
+    # Se l'app telegram non è attaccata, segnaliamolo
+    tg_app = getattr(app.state, "tg_app", None)
+    info["telegram_app"] = bool(tg_app)
 
-    # process_update è async: lo awaitiamo
-    await application.process_update(update)
+    return info
+
+
+@app.get("/ping")
+async def ping():
     return {"ok": True}
+
+
+# ----------------------------
+# Telegram Webhook endpoint
+# ----------------------------
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    """
+    Telegram manda update JSON qui.
+    Noi lo trasformiamo in Update e lo passiamo a PTB.
+    """
+    tg_app = getattr(app.state, "tg_app", None)
+    if tg_app is None:
+        # se arriva un update durante cold start / init non completata
+        return JSONResponse({"ok": False, "error": "telegram app not ready"}, status_code=503)
+
+    try:
+        payload: Dict[str, Any] = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+
+    try:
+        update = Update.de_json(payload, tg_app.bot)
+        await tg_app.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        LOG.exception(f"Errore process_update: {e}")
+        # Telegram vuole 200 spesso comunque, ma mettiamo ok=True per non ritentare all'infinito
+        return JSONResponse({"ok": True, "warning": "update processing failed"})
