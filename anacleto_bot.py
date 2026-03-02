@@ -13,8 +13,6 @@ import logging
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
-PDF_DIR = Path(__file__).resolve().parent / "data" / "pdfs"
-pdf_paths = sorted(PDF_DIR.glob("*.pdf"))  # prende anche *_ocr.pdf
 from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
@@ -52,7 +50,9 @@ ALLOWED_GROUP_ID = os.getenv("ALLOWED_GROUP_ID", "").strip()
 
 # Directory PDF:
 BASE_DIR = Path(__file__).resolve().parent
-PDF_DIR = Path(os.getenv("PDF_DIR", str(BASE_DIR / "data" / "pdfs")))
+PDF_DIR = Path(
+    os.getenv("PDF_DIR", str(BASE_DIR / "data" / "pdfs"))
+).resolve()
 
 # Schedules (Europe/Rome)
 TZ_NAME = os.getenv("TZ_NAME", "Europe/Rome")
