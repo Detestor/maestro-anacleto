@@ -1,128 +1,122 @@
 import os
 import logging
+import asyncio
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
 from telegram import Update
 
+# ✅ IMPORTA IL TUO BUILDER
+# Se nel tuo anacleto_bot.py è build_application(), lascia così.
 from anacleto_bot import build_application, BOT_DISPLAY
 
-
-# ----------------------------
-# Logging
-# ----------------------------
 LOG = logging.getLogger("ANACLETO_WEB")
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-# ----------------------------
-# Env / Config
-# ----------------------------
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # sanity check (di solito lo usa anacleto_bot)
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram")
+WEBHOOK_URL = f"{PUBLIC_BASE_URL}{WEBHOOK_PATH}" if PUBLIC_BASE_URL else ""
+
+_application = None  # type: Optional[object]
 
 
-def webhook_url() -> str:
-    return f"{PUBLIC_BASE_URL}/telegram" if PUBLIC_BASE_URL else ""
+async def _set_webhook(app):
+    if not WEBHOOK_URL:
+        LOG.warning("PUBLIC_BASE_URL non settata: webhook NON impostato.")
+        return
+    try:
+        ok = await app.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES)
+        LOG.info("✅ %s webhook set: %s | ok=%s", BOT_DISPLAY, WEBHOOK_URL, ok)
+    except Exception:
+        LOG.exception("❌ Errore set_webhook")
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Startup:
-      - build PTB application
-      - initialize + start
-      - set webhook su /telegram
-    Shutdown:
-      - stop + shutdown
-    """
-    application = None
+async def lifespan(_: FastAPI):
+    global _application
+    LOG.info("startup…")
+
+    # Crea Application PTB
+    _application = build_application()
+
+    # Initialize + start (necessario per usare process_update)
+    await _application.initialize()
+    await _application.start()
+
+    # Imposta webhook
+    await _set_webhook(_application)
+
+    yield
+
+    LOG.info("🧯 shutdown…")
     try:
-        if not TELEGRAM_TOKEN:
-            LOG.warning("TELEGRAM_TOKEN mancante nelle env.")
-        if not PUBLIC_BASE_URL:
-            LOG.warning("PUBLIC_BASE_URL mancante: webhook non verrà configurato.")
-
-        application = build_application()
-        app.state.tg_app = application
-
-        await application.initialize()
-        await application.start()
-
-        if PUBLIC_BASE_URL:
-            try:
-                r = await application.bot.set_webhook(
-                    url=webhook_url(),
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=True,
-                )
-                LOG.info(f"✅ MAESTRO ANACLETO webhook set: {webhook_url()} | ok={bool(r)}")
-            except Exception as e:
-                LOG.exception(f"❌ set_webhook fallita: {e}")
-
-        yield
-
-    finally:
-        try:
-            if application is not None:
-                LOG.info("🧯 shutdown…")
-                await application.stop()
-                await application.shutdown()
-        except Exception as e:
-            LOG.exception(f"Errore shutdown: {e}")
+        if _application:
+            await _application.stop()
+            await _application.shutdown()
+    except Exception:
+        LOG.exception("Errore durante shutdown")
 
 
-app = FastAPI(title="Maestro Anacleto", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 
-# ----------------------------
-# Routes base (GET + HEAD)
-# ----------------------------
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 async def root():
     return {"ok": True, "service": BOT_DISPLAY}
 
 
-@app.api_route("/health", methods=["GET", "HEAD"])
-async def health():
-    tg_app = getattr(app.state, "tg_app", None)
-    return {
-        "ok": True,
-        "service": BOT_DISPLAY,
-        "telegram_app": bool(tg_app),
-        "public_base_url": PUBLIC_BASE_URL or None,
-    }
-
-
-@app.api_route("/ping", methods=["GET", "HEAD"])
-async def ping():
+@app.get("/health")
+async def health_get():
+    # deve essere sempre 200 per Render/UptimeRobot
     return {"ok": True}
 
 
-# ----------------------------
-# Telegram Webhook
-# ----------------------------
-@app.post("/telegram")
+@app.head("/health")
+async def health_head():
+    # HEAD deve tornare 200 senza body
+    return Response(status_code=200)
+
+
+@app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request):
-    tg_app = getattr(app.state, "tg_app", None)
-    if tg_app is None:
-        return JSONResponse({"ok": False, "error": "telegram app not ready"}, status_code=503)
+    if _application is None:
+        return JSONResponse({"ok": False, "error": "bot not ready"}, status_code=503)
 
-    try:
-        payload: Dict[str, Any] = await request.json()
-    except Exception:
-        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+    data = await request.json()
+    update = Update.de_json(data, _application.bot)
 
-    try:
-        update = Update.de_json(payload, tg_app.bot)
-        await tg_app.process_update(update)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        LOG.exception(f"Errore process_update: {e}")
-        # meglio rispondere 200 per evitare retry aggressivi di Telegram
-        return JSONResponse({"ok": True, "warning": "update processing failed"})
+    # process_update è async e gestisce handlers ecc.
+    await _application.process_update(update)
+    return {"ok": True}
+
+from pathlib import Path
+
+@app.get("/debug/pdfs")
+async def debug_pdfs():
+    base = Path(__file__).resolve().parent
+    pdf_dir = base / "data" / "pdfs"
+
+    files = []
+    if pdf_dir.exists():
+        for p in sorted(pdf_dir.glob("*.pdf")):
+            try:
+                head = p.read_bytes()[:120].decode("utf-8", errors="ignore")
+            except Exception:
+                head = ""
+            files.append({
+                "name": p.name,
+                "size": p.stat().st_size,
+                "head": head[:120],
+            })
+
+    return {
+        "cwd": str(Path().resolve()),
+        "base": str(base),
+        "pdf_dir": str(pdf_dir),
+        "pdf_dir_exists": pdf_dir.exists(),
+        "count": len(files),
+        "files": files[:30],  # basta e avanza
+    }
