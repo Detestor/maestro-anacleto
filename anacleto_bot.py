@@ -1,727 +1,585 @@
+# =========================
+# MAESTRO ANACLETO - BOT
+# anacleto_bot.py
+# =========================
+
 from __future__ import annotations
 
 import os
 import re
+import time
 import random
 import logging
-import datetime as dt
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Any
+from typing import List, Dict, Optional, Tuple
+from pathlib import Path
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
-import httpx
 
 from telegram import Update
-from telegram.constants import ChatType
+from telegram.constants import ParseMode
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     ContextTypes,
     filters,
 )
-from telegram.error import Conflict
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# PDF text extraction (no OCR)
+# Optional: pypdf per estrazione testo
 try:
-    from pypdf import PdfReader  # pip install pypdf
-    PDF_READER_OK = True
+    from pypdf import PdfReader  # type: ignore
+    HAVE_PYPDF = True
 except Exception:
-    PdfReader = None
-    PDF_READER_OK = False
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+    HAVE_PYPDF = False
 
 
-# ===================== LOGGING =====================
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.INFO)
-log = logging.getLogger("ANACLETO")
+# -------------------------
+# Config / Constants
+# -------------------------
 
-
-# ===================== ENV =====================
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BOT_USERNAME = os.getenv("BOT_USERNAME", "MaestroAnacletoBot").lstrip("@").strip()
-ALLOWED_GROUP_ID_RAW = os.getenv("ALLOWED_GROUP_ID", "").strip()
-TZ_NAME = os.getenv("TZ", "Europe/Rome").strip()
-BOT_DISPLAY = os.getenv("BOT_DISPLAY", "MAESTRO ANACLETO").strip()
+BOT_DISPLAY = "MAESTRO ANACLETO"
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
-PDF_DIR = os.getenv("PDF_DIR", "data/pdfs").strip()
+# Allow group restriction (supergroup id). If empty -> allow all.
+ALLOWED_GROUP_ID = os.getenv("ALLOWED_GROUP_ID", "").strip()
 
-ALLOWED_GROUP_ID: Optional[int] = None
-if ALLOWED_GROUP_ID_RAW:
+# Directory PDF:
+BASE_DIR = Path(__file__).resolve().parent
+PDF_DIR = Path(os.getenv("PDF_DIR", str(BASE_DIR / "data" / "pdfs")))
+
+# Schedules (Europe/Rome)
+TZ_NAME = os.getenv("TZ_NAME", "Europe/Rome")
+MORNING_HHMM = os.getenv("MORNING_HHMM", "08:20")
+NIGHT_HHMM = os.getenv("NIGHT_HHMM", "00:24")
+
+# Search tuning
+MAX_SNIPPET_CHARS = 360
+TOP_K = 4
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger = logging.getLogger("ANACLETO")
+logger.setLevel(LOG_LEVEL)
+
+if not logger.handlers:
+    ch = logging.StreamHandler()
+    ch.setLevel(LOG_LEVEL)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def _is_private(update: Update) -> bool:
+    return bool(update.effective_chat and update.effective_chat.type == "private")
+
+
+def _chat_id(update: Update) -> Optional[int]:
+    if update.effective_chat:
+        return update.effective_chat.id
+    return None
+
+
+def _user_mention(update: Update) -> str:
+    u = update.effective_user
+    if not u:
+        return "amico"
+    if u.username:
+        return f"@{u.username}"
+    name = (u.first_name or "amico").strip()
+    return name
+
+
+def _allowed_here(update: Update) -> bool:
+    """Se ALLOWED_GROUP_ID è settato: consenti DM + quel gruppo, blocca altri gruppi."""
+    if _is_private(update):
+        return True
+    if not ALLOWED_GROUP_ID:
+        return True
     try:
-        ALLOWED_GROUP_ID = int(ALLOWED_GROUP_ID_RAW)
-    except ValueError:
-        raise RuntimeError("ALLOWED_GROUP_ID deve essere un intero (es: -1001234567890)")
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN mancante. Mettilo nelle env vars di Render o nel .env locale.")
-
-
-# ===================== TIME HELPERS =====================
-def tz_now() -> dt.datetime:
-    if ZoneInfo is None:
-        return dt.datetime.now()
-    try:
-        return dt.datetime.now(ZoneInfo(TZ_NAME))
+        allowed = int(ALLOWED_GROUP_ID)
     except Exception:
-        return dt.datetime.now()
-
-
-def mention_token() -> str:
-    return f"@{BOT_USERNAME}"
-
-
-def is_night_now() -> bool:
-    h = tz_now().hour
-    return h >= 23 or h < 7
-
-
-def night_intro(user_first: str) -> str:
-    intros = [
-        f"@{user_first}, soffri di insonnia? 😈\n",
-        f"Eh… @{user_first}. A quest’ora. 🌙\n",
-        f"@{user_first} evocazioni notturne? Va bene… parla. 🕯️\n",
-    ]
-    return random.choice(intros)
-
-
-def day_intro(user_first: str) -> str:
-    return f"Salve, @{user_first}. Hai chiamato il {BOT_DISPLAY}. 📚\n"
-
-
-def random_time_today_window(start_hm: Tuple[int, int], end_hm: Tuple[int, int]) -> dt.datetime:
-    now = tz_now()
-    start = now.replace(hour=start_hm[0], minute=start_hm[1], second=0, microsecond=0)
-    end = now.replace(hour=end_hm[0], minute=end_hm[1], second=0, microsecond=0)
-    delta = int((end - start).total_seconds())
-    if delta <= 0:
-        return start
-    return start + dt.timedelta(seconds=random.randint(0, delta))
-
-
-def random_time_night_window() -> dt.datetime:
-    """
-    Finestra: 23:00–00:45 (attraversa mezzanotte)
-    """
-    now = tz_now()
-    today_2300 = now.replace(hour=23, minute=0, second=0, microsecond=0)
-    today_235959 = now.replace(hour=23, minute=59, second=59, microsecond=0)
-
-    tomorrow = now + dt.timedelta(days=1)
-    tomorrow_0000 = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
-    tomorrow_0045 = tomorrow.replace(hour=0, minute=45, second=0, microsecond=0)
-
-    if random.random() < 0.65:
-        delta = int((today_235959 - today_2300).total_seconds())
-        return today_2300 + dt.timedelta(seconds=random.randint(0, max(delta, 1)))
-    else:
-        delta = int((tomorrow_0045 - tomorrow_0000).total_seconds())
-        return tomorrow_0000 + dt.timedelta(seconds=random.randint(0, max(delta, 1)))
-
-
-# ===================== QUOTES =====================
-@dataclass
-class Quote:
-    author: str
-    text: str
-    source: str
-    ref: str
-
-
-# Lista “safe”: evitiamo omonimie tipo Sócrates calciatore
-QUOTE_AUTHORS = [
-    "Allan Kardec",
-    "Rudolf Steiner",
-    "Helena Blavatsky",
-    "Georges Ivanovich Gurdjieff",
-    "Eraclito",
-    "Marco Aurelio",
-    "Epitteto",
-    "Platone",
-]
-
-LOCAL_QUOTES: List[Quote] = [
-    Quote("Eraclito", "Tutto scorre.", "Local", "Frammenti (attrib.)"),
-    Quote("Marco Aurelio", "La vita di un uomo è ciò che i suoi pensieri ne fanno.", "Local", "Meditazioni (attrib.)"),
-    Quote("Epitteto", "Non sono le cose a turbarci, ma i giudizi che diamo alle cose.", "Local", "Enchiridion (attrib.)"),
-    Quote("Platone", "La conoscenza è il nutrimento dell’anima.", "Local", "attrib."),
-    Quote("Allan Kardec", "Il futuro appartiene allo spirito, non alla materia.", "Local", "attrib."),
-]
-
-
-def _looks_like_bio(line: str) -> bool:
-    low = line.lower()
-    bad = [
-        "meglio noto",
-        "nato",
-        "morto",
-        "calciatore",
-        "attore",
-        "cantante",
-        "politico",
-        "biografia",
-        "è un",
-        "fu un",
-    ]
-    return any(b in low for b in bad)
-
-
-async def fetch_wikiquote_quote(author: str) -> Optional[Quote]:
-    """
-    Heuristics: usiamo l’estratto ma scartiamo righe-biografia.
-    Non perfetto, ma evita le ciofeche più comuni.
-    """
-    api = "https://it.wikiquote.org/w/api.php"
-    try:
-        async with httpx.AsyncClient(headers={"User-Agent": "MaestroAnacletoBot/1.0"}) as client:
-            r = await client.get(
-                api,
-                params={
-                    "format": "json",
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": author,
-                    "srlimit": 1,
-                },
-                timeout=10,
-            )
-            r.raise_for_status()
-            hits = r.json().get("query", {}).get("search", [])
-            if not hits:
-                return None
-            title = (hits[0].get("title") or "").strip()
-            if not title:
-                return None
-
-            r2 = await client.get(
-                api,
-                params={
-                    "format": "json",
-                    "action": "query",
-                    "prop": "extracts",
-                    "explaintext": 1,
-                    "exsectionformat": "plain",
-                    "titles": title,
-                },
-                timeout=10,
-            )
-            r2.raise_for_status()
-            pages = r2.json().get("query", {}).get("pages", {})
-            page = next(iter(pages.values())) if pages else {}
-            extract = (page.get("extract") or "").strip()
-            if not extract:
-                return None
-
-            lines = [ln.strip("•- \t") for ln in extract.splitlines()]
-            candidates: List[str] = []
-            for ln in lines:
-                if len(ln) < 25:
-                    continue
-                if ln.endswith(":"):
-                    continue
-                if _looks_like_bio(ln):
-                    continue
-                # deve sembrare una frase-citazione
-                if "“" in ln or "”" in ln or "«" in ln or "»" in ln or ln.count(",") >= 1:
-                    candidates.append(ln)
-
-            if not candidates:
-                return None
-
-            text = random.choice(candidates).strip()
-            url = f"https://it.wikiquote.org/wiki/{title.replace(' ', '_')}"
-            return Quote(author=title, text=text, source="Wikiquote", ref=url)
-
-    except Exception:
-        return None
-
-
-async def get_random_quote() -> Quote:
-    author = random.choice(QUOTE_AUTHORS)
-    q = await fetch_wikiquote_quote(author)
-    if q:
-        return q
-    return random.choice(LOCAL_QUOTES)
-
-
-# ===================== GROUP LOCK / FILTERS =====================
-def in_allowed_context(update: Update) -> bool:
-    if not update.effective_chat:
-        return False
-
-    chat = update.effective_chat
-
-    # Privato: OK (lo vuoi in privato)
-    if chat.type == ChatType.PRIVATE:
         return True
-
-    # Se non hai impostato group id, accetta tutto
-    if ALLOWED_GROUP_ID is None:
-        return True
-
-    return chat.id == ALLOWED_GROUP_ID
+    cid = _chat_id(update)
+    return cid == allowed
 
 
-def is_reply_to_bot(msg) -> bool:
-    try:
-        if msg.reply_to_message and msg.reply_to_message.from_user:
-            u = msg.reply_to_message.from_user
-            return (u.username or "").lower() == BOT_USERNAME.lower()
-    except Exception:
-        pass
-    return False
+def _safe_text(text: str) -> str:
+    """Evita problemi di entities su Telegram. Usiamo HTML minimal e escape."""
+    # Escape HTML basic
+    text = (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+    return text
 
 
-def is_bot_mentioned(msg) -> bool:
-    if not msg:
-        return False
+async def reply_safe(update: Update, text: str) -> None:
+    """Invia testo in modo sicuro (HTML), spezzando se troppo lungo."""
+    if not update.message:
+        return
+    text = text.strip()
+    if not text:
+        return
 
-    if is_reply_to_bot(msg):
-        return True
+    # Telegram max message length ~4096
+    chunks = []
+    while len(text) > 3900:
+        cut = text.rfind("\n", 0, 3900)
+        if cut < 1000:
+            cut = 3900
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
+    chunks.append(text)
 
-    text = msg.text or ""
-    target = mention_token().lower()
-
-    if target in text.lower():
-        return True
-
-    entities = msg.entities or []
-    for ent in entities:
-        if ent.type == "mention":
-            part = text[ent.offset : ent.offset + ent.length].lower()
-            if part == target:
-                return True
-        if ent.type == "text_mention" and ent.user:
-            if (ent.user.username or "").lower() == BOT_USERNAME.lower():
-                return True
-
-    return False
+    for c in chunks:
+        await update.message.reply_text(
+            _safe_text(c),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
-# ===================== CF77 PDF RAG (lite, no OCR) =====================
+def normalize_query(q: str) -> List[str]:
+    q = q.lower().strip()
+    # parole, togli roba corta
+    tokens = re.findall(r"[a-zàèéìòù0-9']+", q, flags=re.IGNORECASE)
+    tokens = [t for t in tokens if len(t) >= 3]
+    return tokens
+
+
+def compact_spaces(s: str) -> str:
+    s = s.replace("\u00ad", "")  # soft hyphen
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def fix_hyphen_linebreaks(s: str) -> str:
+    """
+    Unisce parole spezzate tipo:
+    'par-\nlassero' -> 'parlassero'
+    """
+    s = s.replace("\r\n", "\n")
+    s = re.sub(r"(\w)-\n(\w)", r"\1\2", s)
+    return s
+
+
+# -------------------------
+# Data structures
+# -------------------------
+
 @dataclass
 class PageHit:
     book: str
     page: int
-    text: str
-    score: int
+    score: float
+    snippet: str
 
 
-class CF77Rag:
-    def __init__(self, pdf_dir: str):
-        self.pdf_dir = pdf_dir
-        self.books: List[str] = []
-        self.pages: List[Tuple[str, int, str]] = []  # (book, page, text)
-        self.total_pages = 0
-        self.text_pages = 0
-        self.total_chars = 0
-        self.ready = False
-        self.scan_like = False
+@dataclass
+class PdfIndex:
+    books: int = 0
+    pages: int = 0
+    text_pages: int = 0
+    chars: int = 0
+    entries: List[Tuple[str, int, str]] = None  # (book, page, text)
 
-    def _norm(self, s: str) -> str:
-        s = s.lower()
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
+    def __post_init__(self):
+        if self.entries is None:
+            self.entries = []
 
-    def load(self):
-        self.books = []
-        self.pages = []
-        self.total_pages = 0
-        self.text_pages = 0
-        self.total_chars = 0
-        self.ready = False
-        self.scan_like = False
+# -------------------------
+# PDF Indexing
+# -------------------------
 
-        if not os.path.isdir(self.pdf_dir):
-            log.warning("CF77 PDF dir non trovato: %s", self.pdf_dir)
-            self.ready = True
-            return
-
-        files = sorted([f for f in os.listdir(self.pdf_dir) if f.lower().endswith(".pdf")])
-        self.books = files
-
-        if not PDF_READER_OK:
-            log.warning("pypdf non disponibile: non posso estrarre testo dai PDF.")
-            self.ready = True
-            return
-
-        for fn in files:
-            path = os.path.join(self.pdf_dir, fn)
-            try:
-                reader = PdfReader(path)
-                n = len(reader.pages)
-                self.total_pages += n
-                for i in range(n):
-                    raw = (reader.pages[i].extract_text() or "").strip()
-                    if raw:
-                        self.text_pages += 1
-                        self.total_chars += len(raw)
-                    self.pages.append((fn, i + 1, raw))
-            except Exception as e:
-                log.warning("Errore lettura PDF %s: %s", fn, e)
-
-        # se quasi zero testo -> probabilmente scan
-        if self.total_pages > 0 and self.total_chars < 5000:
-            self.scan_like = True
-
-        self.ready = True
-
-    def sources(self) -> List[str]:
-        return list(self.books)
-
-    def search(self, query: str, top_k: int = 3) -> List[PageHit]:
-        q = self._norm(query)
-        if not q:
-            return []
-
-        # keywords: parole “utili”
-        toks = [t for t in re.split(r"[^\wàèìòù]+", q) if len(t) >= 3]
-        if not toks:
-            return []
-
-        hits: List[PageHit] = []
-        for (book, page, text) in self.pages:
-            if not text:
-                continue
-            norm = self._norm(text)
-            score = sum(1 for t in toks if t in norm)
-            if score <= 0:
-                continue
-            # snippet semplice
-            snippet = text[:1200].strip()
-            hits.append(PageHit(book=book, page=page, text=snippet, score=score))
-
-        hits.sort(key=lambda h: (h.score, len(h.text)), reverse=True)
-        return hits[:top_k]
+def list_pdfs(pdf_dir: Path) -> List[Path]:
+    if not pdf_dir.exists():
+        return []
+    return sorted([p for p in pdf_dir.glob("*.pdf") if p.is_file()])
 
 
-RAG = CF77Rag(PDF_DIR)
-
-
-def format_hit(hit: PageHit) -> str:
-    # evitiamo Markdown per non spaccare parse entities
-    snippet = hit.text.replace("\n", " ").strip()
-    snippet = re.sub(r"\s+", " ", snippet)
-    if len(snippet) > 420:
-        snippet = snippet[:420].rstrip() + "…"
-    return f"📖 {hit.book} — pag. {hit.page}\n{snippet}"
-
-# ===================== SCHEDULED MESSAGES (JobQueue) =====================
-async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_GROUP_ID is None:
-        return
-    q = await get_random_quote()
-    text = (
-        "☀️ Messaggio del mattino (casuale)\n"
-        "Non mi chiedere perché sono sveglio.\n\n"
-        f"📜 {q.author}\n"
-        f"“{q.text}”\n\n"
-        f"Fonte: {q.source}\n{q.ref}"
-    )
-    await context.bot.send_message(
-        chat_id=ALLOWED_GROUP_ID,
-        text=text,
-        disable_web_page_preview=True,
-    )
-
-
-async def send_good_night(context: ContextTypes.DEFAULT_TYPE):
-    if ALLOWED_GROUP_ID is None:
-        return
-    q = await get_random_quote()
-    text = (
-        "🌙 Messaggio della notte (casuale)\n"
-        "Io torno nel mio piano dimensionale.\n\n"
-        f"📜 {q.author}\n"
-        f"“{q.text}”\n\n"
-        f"Fonte: {q.source}\n{q.ref}"
-    )
-    await context.bot.send_message(
-        chat_id=ALLOWED_GROUP_ID,
-        text=text,
-        disable_web_page_preview=True,
-    )
-
-
-def plan_today_jobs(application):
+def extract_pdf_text(pdf_path: Path) -> List[str]:
     """
-    Pianifica ogni giorno:
-    - mattino random 08:00–09:00
-    - notte random 23:00–00:45
+    Ritorna lista di testi per pagina (1-indexed concettualmente).
+    Richiede pypdf.
     """
-    if ALLOWED_GROUP_ID is None:
-        log.warning("ALLOWED_GROUP_ID non impostato: non pianifico messaggi.")
+    if not HAVE_PYPDF:
+        raise RuntimeError("pypdf non disponibile")
+
+    reader = PdfReader(str(pdf_path))
+    pages_text: List[str] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        t = fix_hyphen_linebreaks(t)
+        t = compact_spaces(t)
+        pages_text.append(t)
+    return pages_text
+
+
+def build_index(pdf_dir: Path) -> PdfIndex:
+    idx = PdfIndex()
+    pdfs = list_pdfs(pdf_dir)
+    idx.books = len(pdfs)
+
+    if not pdfs:
+        return idx
+
+    if not HAVE_PYPDF:
+        logger.warning("pypdf non disponibile: non posso estrarre testo dai PDF.")
+        return idx
+
+    for pdf in pdfs:
+        book = pdf.name
+        try:
+            pages = extract_pdf_text(pdf)
+        except Exception as e:
+            logger.error(f"Errore lettura PDF {book}: {e}")
+            continue
+
+        for pi, text in enumerate(pages, start=1):
+            idx.pages += 1
+            if text:
+                idx.text_pages += 1
+                idx.chars += len(text)
+            idx.entries.append((book, pi, text))
+
+    return idx
+
+
+def score_page(text: str, tokens: List[str]) -> float:
+    if not text:
+        return 0.0
+    lt = text.lower()
+    score = 0.0
+    for t in tokens:
+        # punteggio per occorrenze
+        c = lt.count(t)
+        if c:
+            score += min(5, c) * 1.0
+            # bonus se appare all'inizio
+            if lt.find(t) < 120:
+                score += 0.7
+    # bonus se più token presenti
+    present = sum(1 for t in set(tokens) if t in lt)
+    score += present * 0.4
+    return score
+
+
+def make_snippet(text: str, tokens: List[str]) -> str:
+    if not text:
+        return ""
+    lt = text.lower()
+
+    # trova prima occorrenza di qualunque token
+    pos = None
+    for t in tokens:
+        p = lt.find(t)
+        if p != -1:
+            pos = p if pos is None else min(pos, p)
+
+    if pos is None:
+        # fallback: inizio pagina
+        snip = text[:MAX_SNIPPET_CHARS]
+        return snip.strip()
+
+    start = max(0, pos - 140)
+    end = min(len(text), start + MAX_SNIPPET_CHARS)
+    snip = text[start:end].strip()
+
+    # aggiungi ellissi se tagliato
+    if start > 0:
+        snip = "… " + snip
+    if end < len(text):
+        snip = snip + " …"
+    return snip
+
+
+def search_index(idx: PdfIndex, query: str, top_k: int = TOP_K) -> List[PageHit]:
+    tokens = normalize_query(query)
+    if not tokens:
+        return []
+
+    hits: List[PageHit] = []
+    for (book, page, text) in idx.entries:
+        s = score_page(text, tokens)
+        if s <= 0:
+            continue
+        snip = make_snippet(text, tokens)
+        hits.append(PageHit(book=book, page=page, score=s, snippet=snip))
+
+    hits.sort(key=lambda h: h.score, reverse=True)
+    return hits[:top_k]
+
+
+# -------------------------
+# Quotes (semplice ma decente)
+# -------------------------
+
+FALLBACK_QUOTES = [
+    ("Cerchio Firenze 77 (idea guida)", "Conosci te stesso, e cambia il mondo."),
+    ("Stoici (riassunto)", "Non controlli gli eventi, controlli la risposta."),
+    ("Socrate (parafrasi)", "La vita non esaminata non vale d’essere vissuta."),
+    ("Plotino (parafrasi)", "Rientra in te stesso: lì abita la verità."),
+    ("Spiritualità (pratica)", "Il silenzio non è vuoto: è ascolto."),
+]
+
+
+def get_quote() -> Tuple[str, str]:
+    return random.choice(FALLBACK_QUOTES)
+
+
+# -------------------------
+# Telegram Commands
+# -------------------------
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_here(update):
         return
 
-    if application.job_queue is None:
-        log.error("JobQueue non disponibile. Assicurati di usare python-telegram-bot[job-queue].")
-        return
-
-    now = tz_now()
-    gm_time = random_time_today_window((8, 0), (9, 0))
-    gn_time = random_time_night_window()
-
-    # se il bot si avvia “tardi”, scheduliamo a breve per non saltare il giorno
-    if gm_time <= now:
-        gm_time = now + dt.timedelta(minutes=2)
-    if gn_time <= now:
-        gn_time = now + dt.timedelta(minutes=3)
-
-    for name in ("good_morning", "good_night"):
-        for j in application.job_queue.get_jobs_by_name(name):
-            j.schedule_removal()
-
-    application.job_queue.run_once(send_good_morning, when=gm_time, name="good_morning")
-    application.job_queue.run_once(send_good_night, when=gn_time, name="good_night")
-
-    log.info("Pianificato mattino: %s | notte: %s", gm_time, gn_time)
-
-
-async def daily_planner(context: ContextTypes.DEFAULT_TYPE):
-    plan_today_jobs(context.application)
-
-
-# ===================== COMMANDS =====================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
-        return
-    await update.message.reply_text(
-        f"Sono {BOT_DISPLAY} 🕯️\n\n"
-        "✅ In privato rispondo sempre.\n"
-        "✅ In gruppo rispondo solo se mi menzioni o mi fai reply.\n"
-        "✅ Messaggi random: mattino 08:00–09:00, notte 23:00–00:45.\n\n"
+    msg = (
+        f"📚 <b>{BOT_DISPLAY}</b>\n\n"
         "Comandi:\n"
-        "• /ping\n"
-        "• /status\n"
-        "• /sources\n"
-        "• /ask <domanda>\n"
-        "• /quote\n"
-        "• /test_gm\n"
-        "• /test_gn\n"
+        "• <b>/ask &lt;domanda&gt;</b> — cerca nei libri CF77\n"
+        "• <b>/sources</b> — lista PDF caricati\n"
+        "• <b>/status</b> — stato bot + indicizzazione\n"
+        "• <b>/quote</b> — citazione random (fallback)\n\n"
+        "Nota: in DM funziona sempre. Nel gruppo, solo se autorizzato."
     )
+    await reply_safe(update, msg)
 
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_here(update):
         return
-    await update.message.reply_text("🏓 Pong. Io sono sveglio. Purtroppo.")
 
+    idx: PdfIndex = context.application.bot_data.get("pdf_index")  # type: ignore
+    pdf_ok = "✅" if idx and idx.books > 0 else "❌"
+    jq = "✅" if context.application.job_queue else "❌"
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
-        return
-    lock = f"🔒 ALLOWED_GROUP_ID={ALLOWED_GROUP_ID}" if ALLOWED_GROUP_ID is not None else "🔓 ALLOWED_GROUP_ID non impostato"
-    jq = "✅" if (context.application.job_queue is not None) else "❌"
-    pdf = f"✅ {len(RAG.books)} libri / {RAG.total_pages} pagine / testo:{RAG.text_pages} / chars:{RAG.total_chars}"
-    if RAG.scan_like:
-        pdf += " ⚠️ (sembra scansione → serve OCR)"
-    await update.message.reply_text(
-        "📌 Status\n"
-        f"• Username: {mention_token()}\n"
-        f"• {lock}\n"
+    msg = (
+        "📌 <b>Status</b>\n"
+        f"• Username: @{(context.bot.username or 'unknown')}\n"
+        f"• 🔒 ALLOWED_GROUP_ID={ALLOWED_GROUP_ID or '(none)'}\n"
         f"• JobQueue: {jq}\n"
-        f"• PDF: {pdf}\n"
-        "• Quote: ✅ (Wikiquote + fallback)\n"
+        f"• PDF: {pdf_ok} {idx.books if idx else 0} libri / {idx.pages if idx else 0} pagine / "
+        f"testo:{idx.text_pages if idx else 0} / chars:{idx.chars if idx else 0}\n"
+        f"• pypdf: {'✅' if HAVE_PYPDF else '❌'}\n"
+        f"• PDF_DIR: {PDF_DIR}"
     )
+    await reply_safe(update, msg)
 
 
-async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
+async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_here(update):
         return
-    if not RAG.books:
-        await update.message.reply_text("📚 Nessun PDF trovato in data/pdfs.")
+
+    pdfs = list_pdfs(PDF_DIR)
+    if not pdfs:
+        await reply_safe(update, "📚 Nessun PDF trovato in <b>data/pdfs</b>.")
         return
-    lines = "\n".join([f"• {b}" for b in RAG.books])
-    await update.message.reply_text("📚 Libri CF77 caricati\n" + lines)
+
+    lines = ["📚 <b>Libri CF77 caricati</b>"]
+    for p in pdfs:
+        lines.append(f"• {p.name}")
+    await reply_safe(update, "\n".join(lines))
 
 
-async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
+async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_here(update):
         return
-    q = await get_random_quote()
-    # niente Markdown: evita BadRequest parse entities
-    await update.message.reply_text(
-        f"📜 {q.author}\n“{q.text}”\n\nFonte: {q.source}\n{q.ref}",
-        disable_web_page_preview=True,
+
+    author, quote = get_quote()
+    msg = f"📜 <b>{author}</b>\n“{quote}”"
+    await reply_safe(update, msg)
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _allowed_here(update):
+        return
+
+    if not update.message:
+        return
+
+    text = update.message.text or ""
+    parts = text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await reply_safe(update, "Usa: <b>/ask &lt;domanda&gt;</b>")
+        return
+
+    question = parts[1].strip()
+    user = _user_mention(update)
+
+    idx: PdfIndex = context.application.bot_data.get("pdf_index")  # type: ignore
+    if not idx or idx.books == 0 or idx.pages == 0:
+        await reply_safe(update, "😤 Non ho PDF indicizzati al momento. Prova <b>/sources</b> e <b>/status</b>.")
+        return
+
+    hits = search_index(idx, question, top_k=TOP_K)
+
+    header = (
+        f"Salve, <b>{user}</b>. Hai chiamato il <b>{BOT_DISPLAY}</b>. 📚\n"
+        f"📌 <b>Domanda</b>: {question}\n"
     )
-
-
-async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
-        return
-
-    user_first = update.message.from_user.first_name if update.message.from_user else "umano"
-    question = " ".join(context.args).strip()
-
-    if not question:
-        await update.message.reply_text("Usa: /ask <domanda>")
-        return
-
-    intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-
-    if not RAG.ready:
-        await update.message.reply_text(intro + "⏳ Sto ancora caricando i PDF. Riprova tra poco.")
-        return
-
-    if RAG.total_pages == 0 or not RAG.books:
-        await update.message.reply_text(intro + "😤 Non ho PDF caricati. Mettili in data/pdfs e fai redeploy.")
-        return
-
-    hits = RAG.search(question, top_k=3)
 
     if not hits:
-        extra = ""
-        if RAG.scan_like:
-            extra = "\n\n⚠️ Nota: questi PDF sembrano scansioni (testo quasi assente). Per risposte vere serve OCR/EPUB."
-        await update.message.reply_text(
-            intro
-            + "📌 Domanda ricevuta:\n"
-            + question
-            + "\n\n😤 Non ho trovato un passaggio chiaro nei PDF indicizzati."
-            + "\nProva con parole chiave più specifiche (es: “piano astrale”, “trapasso”, “corpo sottile”, “dimensione mentale”)."
-            + extra
+        tail = (
+            "😤 Non ho trovato un passaggio chiaro nei PDF.\n"
+            "Prova a riformulare con parole chiave più specifiche "
+            "(es: “piano astrale”, “corpo astrale”, “trapasso”)."
         )
+        await reply_safe(update, header + "\n" + tail)
         return
 
-    parts = [format_hit(h) for h in hits]
-    body = "\n\n— — —\n\n".join(parts)
+    lines = [header, "\n🧠 <b>Passaggi rilevanti</b>:"]
+    for i, h in enumerate(hits, start=1):
+        lines.append(
+            f"\n<b>{i})</b> <i>{h.book}</i> — pag. <b>{h.page}</b>\n"
+            f"{h.snippet}"
+        )
 
-    await update.message.reply_text(
-        intro
-        + "📌 Domanda:\n"
-        + question
-        + "\n\n🔎 Trovato nei testi:\n\n"
-        + body
-    )
+    await reply_safe(update, "\n".join(lines))
+
+# -------------------------
+# Scheduler jobs (buongiorno / buonanotte / planner)
+# -------------------------
+
+def _parse_hhmm(hhmm: str) -> Tuple[int, int]:
+    hhmm = (hhmm or "").strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", hhmm)
+    if not m:
+        return (8, 20)
+    h = int(m.group(1))
+    mi = int(m.group(2))
+    return (h, mi)
 
 
-async def cmd_test_gm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
+async def job_good_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.application.bot_data.get("announce_chat_id")
+    if not chat_id:
         return
-    await send_good_morning(context)
+    a, q = get_quote()
+    msg = f"☀️ <b>Buongiorno</b>\n📜 <b>{a}</b>\n“{q}”"
+    await context.bot.send_message(chat_id=chat_id, text=_safe_text(msg), parse_mode=ParseMode.HTML)
 
 
-async def cmd_test_gn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
+async def job_good_night(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.application.bot_data.get("announce_chat_id")
+    if not chat_id:
         return
-    await send_good_night(context)
+    a, q = get_quote()
+    msg = f"🌙 <b>Buonanotte</b>\n📜 <b>{a}</b>\n“{q}”"
+    await context.bot.send_message(chat_id=chat_id, text=_safe_text(msg), parse_mode=ParseMode.HTML)
 
 
-# ===================== TEXT HANDLER =====================
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not in_allowed_context(update):
-        return
-
-    msg = update.message
-    if not msg:
-        return
-
-    chat = msg.chat
-    user_first = msg.from_user.first_name if msg.from_user else "umano"
-    text = msg.text or ""
-
-    log.info("MSG | chat_type=%s chat_id=%s user=%s text=%s", chat.type, chat.id, user_first, text[:160])
-
-    if chat.type == ChatType.PRIVATE:
-        intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-        await msg.reply_text(intro + "Dimmi pure. (privato)")
-        return
-
-    if not is_bot_mentioned(msg):
-        return
-
-    intro = night_intro(user_first) if is_night_now() else day_intro(user_first)
-    await msg.reply_text(intro + "Ok. Ti ascolto. 😈")
+async def job_daily_planner(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # placeholder: per ora non spamma nulla
+    return
 
 
-# ===================== ERROR HANDLER =====================
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    err = context.error
-    if isinstance(err, Conflict):
-        log.error("CONFLICT: un'altra istanza sta facendo polling. Se sei in webhook, NON usare polling.")
+def schedule_jobs(app: Application) -> None:
+    # decide dove annunciare: se c'è un allowed group id, usa quello, altrimenti nulla.
+    if ALLOWED_GROUP_ID:
+        try:
+            app.bot_data["announce_chat_id"] = int(ALLOWED_GROUP_ID)
+        except Exception:
+            app.bot_data["announce_chat_id"] = None
     else:
-        log.exception("Errore non gestito:", exc_info=err)
+        app.bot_data["announce_chat_id"] = None
 
-
-# ===================== STARTUP HOOK =====================
-async def post_init(application):
-    # 1) Load PDFs (once at boot)
-    try:
-        RAG.load()
-    except Exception as e:
-        log.warning("CF77 RAG load error: %s", e)
-
-    log.info(
-        "CF77 RAG pronto. books=%s pages=%s text_pages=%s chars=%s dir=%s pdfreader=%s scan_like=%s",
-        len(RAG.books), RAG.total_pages, RAG.text_pages, RAG.total_chars, RAG.pdf_dir, PDF_READER_OK, RAG.scan_like
-    )
-
-    # 2) schedule daily jobs
-    plan_today_jobs(application)
-
-    # 3) daily planner at 00:05
-    if application.job_queue is None:
-        log.error("JobQueue assente: non posso schedulare daily planner.")
+    if not app.job_queue:
+        logger.warning("JobQueue non disponibile.")
         return
 
-    now = tz_now()
-    next_run = now.replace(hour=0, minute=5, second=0, microsecond=0)
-    if next_run <= now:
-        next_run = next_run + dt.timedelta(days=1)
+    mh, mm = _parse_hhmm(MORNING_HHMM)
+    nh, nm = _parse_hhmm(NIGHT_HHMM)
 
-    application.job_queue.run_repeating(
-        daily_planner,
-        interval=24 * 60 * 60,
-        first=next_run,
-        name="daily_planner",
+    # Nota: PTB JobQueue usa timezone interna dell'event loop; va bene per ora.
+    now = datetime.now()
+    morning = now.replace(hour=mh, minute=mm, second=0, microsecond=0)
+    night = now.replace(hour=nh, minute=nm, second=0, microsecond=0)
+
+    if morning <= now:
+        morning += timedelta(days=1)
+    if night <= now:
+        night += timedelta(days=1)
+
+    # one-shot + reschedule daily via repeating interval (semplice)
+    app.job_queue.run_once(job_good_morning, when=(morning - now).total_seconds(), name="good_morning_once")
+    app.job_queue.run_once(job_good_night, when=(night - now).total_seconds(), name="good_night_once")
+
+    logger.info(f"Pianificato mattino: {morning.isoformat()} | notte: {night.isoformat()}")
+
+
+# -------------------------
+# Build application
+# -------------------------
+
+async def post_init(app: Application) -> None:
+    # indicizza PDF all'avvio
+    t0 = time.time()
+    idx = build_index(PDF_DIR)
+    app.bot_data["pdf_index"] = idx
+    dt = time.time() - t0
+
+    logger.info(
+        f"CF77 RAG pronto. books={idx.books} pages={idx.pages} text_pages={idx.text_pages} "
+        f"chars={idx.chars} dir={PDF_DIR} pdfreader={HAVE_PYPDF}"
     )
-    log.info("Daily planner schedulato per: %s", next_run)
+    logger.info(f"Indicizzazione completata in {dt:.2f}s")
+
+    # schedula job
+    schedule_jobs(app)
 
 
-# ===================== BUILD APP (for Webhook / WebService) =====================
-def build_application():
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+def build_application() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN mancante nelle env vars")
 
-    app.add_error_handler(on_error)
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
+    # Handlers
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("sources", cmd_sources))
-    app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("quote", cmd_quote))
-    app.add_handler(CommandHandler("test_gm", cmd_test_gm))
-    app.add_handler(CommandHandler("test_gn", cmd_test_gn))
+    app.add_handler(CommandHandler("ask", cmd_ask))
 
-    app.add_handler(MessageHandler(filters.TEXT, handle_text))
+    # fallback: se scrivi in privato senza /ask, ti risponde come guida
+    async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
+        if not _allowed_here(update):
+            return
+        if _is_private(update):
+            await reply_safe(update, "Scrivimi con <b>/ask &lt;domanda&gt;</b> 🙂")
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     return app
 
 
-def run_polling_blocking():
-    """
-    SOLO per locale/test. In produzione (webhook) non usare polling.
-    """
-    app = build_application()
-    print(f"{BOT_DISPLAY} è in ascolto…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-def main():
-    run_polling_blocking()
-
-
+# -------------------------
+# Local run (solo per test)
+# -------------------------
 if __name__ == "__main__":
-    main()
+    logger.info(f"{BOT_DISPLAY} è in ascolto…")
+    application = build_application()
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
