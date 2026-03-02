@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
-PDF_DIR = Path(_file_).resolve().parent / "data" / "pdfs"
+PDF_DIR = Path(__file__).resolve().parent / "data" / "pdfs"
 pdf_paths = sorted(PDF_DIR.glob("*.pdf"))  # prende anche *_ocr.pdf
 from datetime import datetime, timedelta
 
