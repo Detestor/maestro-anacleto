@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-MAESTRO ANACLETO — Telegram bot core (PTB v21.x)
+MAESTRO ANACLETO — Telegram bot core (python-telegram-bot v21.x)
 
-✅ SINGLE SOURCE OF TRUTH per PDF_DIR (definita UNA SOLA VOLTA qui)
-✅ build_index() è async-friendly (eseguita con run_in_executor)
-✅ post_init è async come richiesto da PTB v21
-✅ Log dettagliati al boot
+Obiettivo: indicizzare PDF (già OCR) in data/pdfs e rispondere a /ask citando libro+pagina.
+
+NOTE IMPORTANTI (Render + webhook):
+- PDF_DIR è definita UNA SOLA VOLTA qui ed è la fonte di verità.
+- In modalità webhook (FastAPI), l'indice viene costruito a startup dal wrapper web
+  (vedi anacleto_web.py). Qui lasciamo comunque post_init per sicurezza.
 """
 from __future__ import annotations
 
@@ -102,7 +104,7 @@ INDEX: Optional[Cf77Index] = None
 # Helpers
 # ─────────────────────────────────────────
 def _clean_ws(s: str) -> str:
-    s = s.replace("\u00ad", "")
+    s = s.replace("\u00ad", "")  # soft hyphen
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
@@ -117,7 +119,6 @@ def list_pdfs(pdf_dir: Path) -> List[Path]:
         return []
 
 def _extract_one_pdf(path: Path) -> Tuple[int, int, int, List[str]]:
-    """Estrae testo da un PDF. Ritorna (pages_total, text_pages, chars, page_texts)."""
     if not HAVE_PYPDF or PdfReader is None:
         raise RuntimeError("pypdf non disponibile")
 
@@ -149,12 +150,14 @@ def _extract_one_pdf(path: Path) -> Tuple[int, int, int, List[str]]:
 
 
 def build_index(pdf_dir: Path) -> Cf77Index:
-    """Costruisce l'indice. Funzione sincrona — chiamarla via run_in_executor."""
     pdfs = list_pdfs(pdf_dir)
-    logger.info("═" * 50)
+    logger.info("═" * 60)
     logger.info("🔍 build_index START | PDF_DIR=%s | trovati %d PDF", pdf_dir, len(pdfs))
     for p in pdfs:
-        logger.info("  • %s (%d bytes)", p.name, p.stat().st_size)
+        try:
+            logger.info("  • %s (%d bytes)", p.name, p.stat().st_size)
+        except Exception:
+            logger.info("  • %s", p.name)
 
     if not pdfs:
         logger.warning("⚠ Nessun PDF trovato in %s", pdf_dir)
@@ -193,16 +196,23 @@ def build_index(pdf_dir: Path) -> Cf77Index:
         "✅ build_index DONE | books=%d pages=%d text_pages=%d chars=%d chunks=%d",
         result.books, result.pages, result.text_pages, result.chars, len(result.chunks),
     )
-    logger.info("═" * 50)
+    logger.info("═" * 60)
     return result
 
 
 async def build_and_store_index() -> Cf77Index:
-    """Esegue build_index in un thread separato (non blocca l'event loop)."""
     global INDEX
-    loop = asyncio.get_event_loop()
-    INDEX = await loop.run_in_executor(None, build_index, PDF_DIR)
-    return INDEX
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    try:
+        INDEX = await loop.run_in_executor(None, build_index, PDF_DIR)
+        return INDEX
+    except Exception:
+        logger.exception("❌ build_and_store_index fallita")
+        INDEX = Cf77Index(books=0, pages=0, text_pages=0, chars=0, chunks=[])
+        return INDEX
 
 
 # ─────────────────────────────────────────
@@ -226,8 +236,15 @@ def search_index(question: str, idx: Cf77Index, top_k: int = 3) -> List[Tuple[Pa
 
 
 def snippet(text: str, terms: List[str], max_len: int = 420) -> str:
+    if not text:
+        return ""
     low = text.lower()
-    pos = next((low.find(t.lower()) for t in terms if low.find(t.lower()) != -1), None)
+    pos = None
+    for t in terms:
+        i = low.find(t.lower())
+        if i != -1:
+            pos = i
+            break
     if pos is None:
         return (text[:max_len] + "…") if len(text) > max_len else text
     start = max(0, pos - 120)
@@ -259,7 +276,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /status — stato bot + PDF\n"
         "• /sources — lista PDF\n"
         "• /ask &lt;domanda&gt; — cerca nei testi\n"
-        "• /quote — citazione casuale\n"
+        "• /quote — citazione casuale dai testi\n"
+        "• /reindex — ricostruisce l'indice (se hai cambiato PDF)\n"
     )
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
 
@@ -268,7 +286,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_allowed_chat(update):
         return
     idx = INDEX
-    pdf_ok = idx is not None and idx.books > 0 and idx.pages > 0
+    pdf_ok = idx is not None and idx.books > 0 and idx.pages > 0 and idx.text_pages > 0
     pdf_line = (
         f"{'✅' if pdf_ok else '❌'} "
         f"{idx.books if idx else 0} libri / "
@@ -279,7 +297,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     msg = (
         "<b>📌 Status</b>\n"
         f"• Username: {_escape_html(BOT_USERNAME)}\n"
-        f"• ALLOWED_GROUP_ID: {_escape_html(ALLOWED_GROUP_ID) if ALLOWED_GROUP_ID else '—'}\n"
+        f"• 🔒 ALLOWED_GROUP_ID={_escape_html(ALLOWED_GROUP_ID) if ALLOWED_GROUP_ID else '—'}\n"
         f"• PDF: {pdf_line}\n"
         f"• pypdf: {'✅' if HAVE_PYPDF else '❌'}\n"
         f"• PDF_DIR: <code>{_escape_html(str(PDF_DIR))}</code>\n"
@@ -292,10 +310,20 @@ async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     pdfs = list_pdfs(PDF_DIR)
     if not pdfs:
-        await update.effective_message.reply_text("📚 Nessun PDF trovato.")
+        await update.effective_message.reply_text("📚 Nessun PDF trovato in data/pdfs.")
         return
     lines = ["📚 Libri caricati:"] + [f"• {p.name}" for p in pdfs]
     await update.effective_message.reply_text("\n".join(lines))
+
+
+async def cmd_reindex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed_chat(update):
+        return
+    await update.effective_message.reply_text("⏳ Ricostruisco l'indice…")
+    idx = await build_and_store_index()
+    await update.effective_message.reply_text(
+        f"✅ Indice pronto: {idx.books} libri / {idx.pages} pagine / testo:{idx.text_pages} / chars:{idx.chars}"
+    )
 
 
 async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -305,7 +333,7 @@ async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if idx and idx.chunks:
         import random
         ch = random.choice(idx.chunks)
-        q = snippet(ch.text, [], max_len=300)
+        q = snippet(ch.text, [], max_len=320)
         msg = f"📜 <i>{_escape_html(q)}</i>\n\n— {_escape_html(ch.book)}, pag. {ch.page}"
         await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
     else:
@@ -322,16 +350,19 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not idx or not idx.chunks:
         await update.effective_message.reply_text(
-            "😤 Indice non pronto o PDF senza testo estraibile.\nControlla /status."
+            "😤 Indice non pronto o PDF senza testo estraibile.\nControlla /status oppure /reindex."
         )
         return
+
     terms = [t for t in re.findall(r"[a-zàèéìòù0-9']+", q, flags=re.IGNORECASE) if len(t) >= 4]
     results = search_index(q, idx, top_k=3)
     if not results:
         await update.effective_message.reply_text(
-            "😤 Nessun passaggio trovato. Prova con parole chiave più specifiche."
+            "😤 Non ho trovato un passaggio chiaro.\n"
+            "Prova con parole chiave più specifiche (es: “piano astrale”, “corpo astrale”, “trapasso”)."
         )
         return
+
     blocks = []
     for ch, sc in results:
         sn = snippet(ch.text, terms, max_len=420)
@@ -348,6 +379,7 @@ async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         header + "\n\n— — —\n\n".join(blocks),
         parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -359,13 +391,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ─────────────────────────────────────────
-# ✅ post_init — DEVE essere async in PTB v21
+# post_init (PTB v21)
 # ─────────────────────────────────────────
 async def post_init(app: Application) -> None:
-    """Chiamato da PTB dopo initialize(). Costruisce l'indice."""
     logger.info("post_init: avvio build_and_store_index…")
-    await build_and_store_index()
-    logger.info("post_init: indice pronto. books=%d pages=%d", INDEX.books, INDEX.pages)
+    idx = await build_and_store_index()
+    logger.info("post_init: indice pronto. books=%d pages=%d text_pages=%d", idx.books, idx.pages, idx.text_pages)
 
 
 # ─────────────────────────────────────────
@@ -378,7 +409,7 @@ def build_application() -> Application:
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .post_init(post_init)   # ← async, PTB v21 OK
+        .post_init(post_init)
         .build()
     )
 
@@ -386,10 +417,10 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("sources", cmd_sources))
+    app.add_handler(CommandHandler("reindex", cmd_reindex))
     app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
     return app
 
 
