@@ -2,9 +2,10 @@
 """
 MAESTRO ANACLETO — Telegram bot core (PTB v21.x)
 
-✅ SINGLE SOURCE OF TRUTH for PDF_DIR (defined ONCE)
-✅ Global INDEX used by /status and /ask
-✅ Safe HTML escaping to avoid "Can't parse entities"
+✅ SINGLE SOURCE OF TRUTH per PDF_DIR (definita UNA SOLA VOLTA qui)
+✅ build_index() è async-friendly (eseguita con run_in_executor)
+✅ post_init è async come richiesto da PTB v21
+✅ Log dettagliati al boot
 """
 from __future__ import annotations
 
@@ -12,9 +13,10 @@ import os
 import re
 import html
 import logging
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -27,18 +29,21 @@ from telegram.ext import (
     filters,
 )
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Logging
-# ----------------------------
+# ─────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger("ANACLETO")
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Identity / env
-# ----------------------------
+# ─────────────────────────────────────────
 BOT_DISPLAY = "MAESTRO ANACLETO"
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@MaestroAnacletoBot")  # cosmetic
+BOT_USERNAME = os.getenv("BOT_USERNAME", "@MaestroAnacletoBot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 
@@ -49,32 +54,36 @@ if ALLOWED_GROUP_ID:
         ALLOWED_GROUP_ID_INT = int(ALLOWED_GROUP_ID)
     except Exception:
         logger.warning("ALLOWED_GROUP_ID non è un intero valido: %r", ALLOWED_GROUP_ID)
-        ALLOWED_GROUP_ID_INT = None
 
-# ----------------------------
-# ✅ SINGLE PDF_DIR (ONLY HERE)
-# ----------------------------
+# ─────────────────────────────────────────
+# ✅ UNICA DEFINIZIONE DI PDF_DIR — usata ovunque
+# ─────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 PDF_DIR = Path(os.getenv("PDF_DIR", str(BASE_DIR / "data" / "pdfs"))).resolve()
 
-# ----------------------------
-# Optional dependency: pypdf
-# ----------------------------
-HAVE_PYPDF = False
-try:
-    from pypdf import PdfReader  # type: ignore
-    HAVE_PYPDF = True
-except Exception:
-    PdfReader = None  # type: ignore
-    HAVE_PYPDF = False
+logger.info("▶ BASE_DIR=%s", BASE_DIR)
+logger.info("▶ PDF_DIR=%s (env override: %s)", PDF_DIR, bool(os.getenv("PDF_DIR")))
 
-# ----------------------------
+# ─────────────────────────────────────────
+# pypdf
+# ─────────────────────────────────────────
+HAVE_PYPDF = False
+PdfReader = None  # type: ignore
+try:
+    from pypdf import PdfReader as _PdfReader  # type: ignore
+    PdfReader = _PdfReader
+    HAVE_PYPDF = True
+    logger.info("✅ pypdf disponibile")
+except ImportError as e:
+    logger.error("❌ pypdf NON disponibile: %s — i PDF non potranno essere letti!", e)
+
+# ─────────────────────────────────────────
 # Index structures
-# ----------------------------
+# ─────────────────────────────────────────
 @dataclass
 class PageChunk:
     book: str
-    page: int          # 1-based
+    page: int   # 1-based
     text: str
 
 @dataclass
@@ -85,21 +94,21 @@ class Cf77Index:
     chars: int
     chunks: List[PageChunk]
 
-# ✅ Global index (single source)
+# ✅ Global index — scritto da build_and_store_index(), letto da handler
 INDEX: Optional[Cf77Index] = None
 
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Helpers
-# ----------------------------
+# ─────────────────────────────────────────
 def _clean_ws(s: str) -> str:
-    s = s.replace("\u00ad", "")  # soft hyphen
+    s = s.replace("\u00ad", "")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 def _escape_html(s: str) -> str:
-    return html.escape(s, quote=False)
+    return html.escape(str(s), quote=False)
 
 def list_pdfs(pdf_dir: Path) -> List[Path]:
     try:
@@ -107,257 +116,261 @@ def list_pdfs(pdf_dir: Path) -> List[Path]:
     except Exception:
         return []
 
-def extract_pdf_text(path: Path) -> Tuple[int, int, int, List[str]]:
-    """
-    Returns: (pages_total, text_pages, chars, page_texts)
-    """
-    if not HAVE_PYPDF:
+def _extract_one_pdf(path: Path) -> Tuple[int, int, int, List[str]]:
+    """Estrae testo da un PDF. Ritorna (pages_total, text_pages, chars, page_texts)."""
+    if not HAVE_PYPDF or PdfReader is None:
         raise RuntimeError("pypdf non disponibile")
 
     reader = PdfReader(str(path))
     page_texts: List[str] = []
     text_pages = 0
     chars = 0
+    empty_pages = 0
 
-    for i, page in enumerate(reader.pages, start=1):
+    for page in reader.pages:
         try:
             txt = page.extract_text() or ""
-        except Exception:
+        except Exception as e:
+            logger.debug("Errore extract_text pagina: %s", e)
             txt = ""
         txt = _clean_ws(txt)
         if txt:
             text_pages += 1
             chars += len(txt)
+        else:
+            empty_pages += 1
         page_texts.append(txt)
 
+    logger.info(
+        "  📄 %s: %d pag totali / %d con testo / %d vuote / %d chars",
+        path.name, len(reader.pages), text_pages, empty_pages, chars,
+    )
     return len(reader.pages), text_pages, chars, page_texts
 
+
 def build_index(pdf_dir: Path) -> Cf77Index:
+    """Costruisce l'indice. Funzione sincrona — chiamarla via run_in_executor."""
     pdfs = list_pdfs(pdf_dir)
-    logger.info("PDF_DIR=%s | trovati %s pdf: %s", pdf_dir, len(pdfs), [p.name for p in pdfs][:50])
+    logger.info("═" * 50)
+    logger.info("🔍 build_index START | PDF_DIR=%s | trovati %d PDF", pdf_dir, len(pdfs))
+    for p in pdfs:
+        logger.info("  • %s (%d bytes)", p.name, p.stat().st_size)
+
+    if not pdfs:
+        logger.warning("⚠ Nessun PDF trovato in %s", pdf_dir)
+        return Cf77Index(books=0, pages=0, text_pages=0, chars=0, chunks=[])
+
+    if not HAVE_PYPDF:
+        logger.error("❌ pypdf non disponibile — indice vuoto (books count-only)")
+        return Cf77Index(books=len(pdfs), pages=0, text_pages=0, chars=0, chunks=[])
 
     chunks: List[PageChunk] = []
     total_pages = 0
     total_text_pages = 0
     total_chars = 0
 
-    if not pdfs:
-        return Cf77Index(books=0, pages=0, text_pages=0, chars=0, chunks=[])
-
-    if not HAVE_PYPDF:
-        logger.warning("pypdf non disponibile: non posso estrarre testo dai PDF.")
-        return Cf77Index(books=len(pdfs), pages=0, text_pages=0, chars=0, chunks=[])
-
     for pdf in pdfs:
         try:
-            pages, text_pages, chars, page_texts = extract_pdf_text(pdf)
+            pages, text_pages, chars, page_texts = _extract_one_pdf(pdf)
             total_pages += pages
             total_text_pages += text_pages
             total_chars += chars
-
             bookname = pdf.name
             for idx, txt in enumerate(page_texts, start=1):
                 if txt:
                     chunks.append(PageChunk(book=bookname, page=idx, text=txt))
+        except Exception:
+            logger.exception("❌ Errore estrazione testo da %s", pdf.name)
 
-        except Exception as e:
-            logger.exception("Errore estrazione testo da %s: %s", pdf.name, e)
-
-    return Cf77Index(
+    result = Cf77Index(
         books=len(pdfs),
         pages=total_pages,
         text_pages=total_text_pages,
         chars=total_chars,
         chunks=chunks,
     )
+    logger.info(
+        "✅ build_index DONE | books=%d pages=%d text_pages=%d chars=%d chunks=%d",
+        result.books, result.pages, result.text_pages, result.chars, len(result.chunks),
+    )
+    logger.info("═" * 50)
+    return result
 
+
+async def build_and_store_index() -> Cf77Index:
+    """Esegue build_index in un thread separato (non blocca l'event loop)."""
+    global INDEX
+    loop = asyncio.get_event_loop()
+    INDEX = await loop.run_in_executor(None, build_index, PDF_DIR)
+    return INDEX
+
+
+# ─────────────────────────────────────────
+# Search helpers
+# ─────────────────────────────────────────
 def search_index(question: str, idx: Cf77Index, top_k: int = 3) -> List[Tuple[PageChunk, int]]:
     q = _clean_ws(question).lower()
     if not q or not idx.chunks:
         return []
-
-    # keywords: words >= 4 chars
     terms = [t for t in re.findall(r"[a-zàèéìòù0-9']+", q, flags=re.IGNORECASE) if len(t) >= 4]
     if not terms:
         terms = [q]
-
-    scored: List[Tuple[int, PageChunk]] = []
+    scored = []
     for ch in idx.chunks:
         text_l = ch.text.lower()
-        score = 0
-        for t in terms:
-            score += text_l.count(t)
+        score = sum(text_l.count(t) for t in terms)
         if score > 0:
             scored.append((score, ch))
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(ch, sc) for sc, ch in scored[:top_k]]
 
-def snippet(text: str, terms: List[str], max_len: int = 420) -> str:
-    t = text
-    low = t.lower()
-    pos = None
-    for term in terms:
-        p = low.find(term.lower())
-        if p != -1:
-            pos = p
-            break
-    if pos is None:
-        return (t[:max_len] + "…") if len(t) > max_len else t
 
+def snippet(text: str, terms: List[str], max_len: int = 420) -> str:
+    low = text.lower()
+    pos = next((low.find(t.lower()) for t in terms if low.find(t.lower()) != -1), None)
+    if pos is None:
+        return (text[:max_len] + "…") if len(text) > max_len else text
     start = max(0, pos - 120)
-    end = min(len(t), start + max_len)
-    s = t[start:end]
-    if start > 0:
-        s = "…" + s
-    if end < len(t):
-        s = s + "…"
+    end = min(len(text), start + max_len)
+    s = ("…" if start > 0 else "") + text[start:end] + ("…" if end < len(text) else "")
     return s
 
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Access control
-# ----------------------------
+# ─────────────────────────────────────────
 def is_allowed_chat(update: Update) -> bool:
-    # Always allow private
     if update.effective_chat and update.effective_chat.type == "private":
         return True
-
-    # If group restriction is set, enforce it
     if ALLOWED_GROUP_ID_INT is not None and update.effective_chat:
         return update.effective_chat.id == ALLOWED_GROUP_ID_INT
-
-    # Otherwise allow
     return True
 
 
-# ----------------------------
-# Commands
-# ----------------------------
+# ─────────────────────────────────────────
+# Command handlers
+# ─────────────────────────────────────────
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update):
         return
-
     msg = (
         f"<b>{_escape_html(BOT_DISPLAY)}</b> 📚\n\n"
         "Comandi:\n"
         "• /status — stato bot + PDF\n"
         "• /sources — lista PDF\n"
         "• /ask &lt;domanda&gt; — cerca nei testi\n"
-        "• /quote — citazione (placeholder)\n"
+        "• /quote — citazione casuale\n"
     )
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update):
         return
-
-    global INDEX
     idx = INDEX
-
     pdf_ok = idx is not None and idx.books > 0 and idx.pages > 0
-    pdf_line = f"{'✅' if pdf_ok else '❌'} {idx.books if idx else 0} libri / {idx.pages if idx else 0} pagine / testo:{idx.text_pages if idx else 0} / chars:{idx.chars if idx else 0}"
-
+    pdf_line = (
+        f"{'✅' if pdf_ok else '❌'} "
+        f"{idx.books if idx else 0} libri / "
+        f"{idx.pages if idx else 0} pagine / "
+        f"testo:{idx.text_pages if idx else 0} / "
+        f"chars:{idx.chars if idx else 0}"
+    )
     msg = (
         "<b>📌 Status</b>\n"
         f"• Username: {_escape_html(BOT_USERNAME)}\n"
-        f"• 🔒 ALLOWED_GROUP_ID={_escape_html(ALLOWED_GROUP_ID) if ALLOWED_GROUP_ID else '—'}\n"
-        f"• JobQueue: ✅\n"
+        f"• ALLOWED_GROUP_ID: {_escape_html(ALLOWED_GROUP_ID) if ALLOWED_GROUP_ID else '—'}\n"
         f"• PDF: {pdf_line}\n"
         f"• pypdf: {'✅' if HAVE_PYPDF else '❌'}\n"
-        f"• PDF_DIR: {_escape_html(str(PDF_DIR))}\n"
+        f"• PDF_DIR: <code>{_escape_html(str(PDF_DIR))}</code>\n"
     )
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 
 async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update):
         return
-
     pdfs = list_pdfs(PDF_DIR)
     if not pdfs:
-        await update.effective_message.reply_text("📚 Nessun PDF trovato in data/pdfs.")
+        await update.effective_message.reply_text("📚 Nessun PDF trovato.")
         return
-
-    lines = ["📚 Libri CF77 caricati"]
-    for p in pdfs:
-        lines.append(f"• {p.name}")
+    lines = ["📚 Libri caricati:"] + [f"• {p.name}" for p in pdfs]
     await update.effective_message.reply_text("\n".join(lines))
+
 
 async def cmd_quote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update):
         return
-    # Placeholder: keep simple & safe
-    await update.effective_message.reply_text("📜 “Conosci te stesso.” — (placeholder)")
+    idx = INDEX
+    if idx and idx.chunks:
+        import random
+        ch = random.choice(idx.chunks)
+        q = snippet(ch.text, [], max_len=300)
+        msg = f"📜 <i>{_escape_html(q)}</i>\n\n— {_escape_html(ch.book)}, pag. {ch.page}"
+        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+    else:
+        await update.effective_message.reply_text('📜 "Conosci te stesso." — (indice non pronto)')
+
 
 async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed_chat(update):
         return
-
-    global INDEX
     idx = INDEX
-
     q = " ".join(context.args).strip() if context.args else ""
     if not q:
         await update.effective_message.reply_text("Usa: /ask <domanda>")
         return
-
-    if idx is None or idx.books == 0 or idx.pages == 0 or not idx.chunks:
+    if not idx or not idx.chunks:
         await update.effective_message.reply_text(
-            "😤 Non ho un indice pronto o i PDF non hanno testo estraibile.\n"
-            "Controlla /status e /sources."
+            "😤 Indice non pronto o PDF senza testo estraibile.\nControlla /status."
         )
         return
-
     terms = [t for t in re.findall(r"[a-zàèéìòù0-9']+", q, flags=re.IGNORECASE) if len(t) >= 4]
     results = search_index(q, idx, top_k=3)
-
     if not results:
         await update.effective_message.reply_text(
-            "😤 Non ho trovato un passaggio chiaro nei PDF indicizzati.\n"
-            "Prova con parole chiave più specifiche (es: “piano astrale”, “trapasso”, “corpo astrale”)."
+            "😤 Nessun passaggio trovato. Prova con parole chiave più specifiche."
         )
         return
-
     blocks = []
     for ch, sc in results:
         sn = snippet(ch.text, terms, max_len=420)
         blocks.append(
-            f"<b>📖 { _escape_html(ch.book) }</b> — pag. <b>{ch.page}</b>\n"
+            f"<b>📖 {_escape_html(ch.book)}</b> — pag. <b>{ch.page}</b>\n"
             f"{_escape_html(sn)}"
         )
-
     header = (
-        f"Salve, <b>@{_escape_html(update.effective_user.username or 'utente')}</b>. Hai chiamato il { _escape_html(BOT_DISPLAY) } 📚\n"
-        f"📌 Domanda ricevuta:\n{_escape_html(q)}\n\n"
+        f"Salve, <b>@{_escape_html(update.effective_user.username or 'utente')}</b>. "
+        f"Hai chiamato il {_escape_html(BOT_DISPLAY)} 📚\n"
+        f"📌 <i>{_escape_html(q)}</i>\n\n"
         "🧠 Passaggi trovati:\n\n"
     )
-    msg = header + "\n\n— — —\n\n".join(blocks)
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(
+        header + "\n\n— — —\n\n".join(blocks),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Optional: ignore plain text in groups; allow in private with hint
     if not is_allowed_chat(update):
         return
     if update.effective_chat and update.effective_chat.type == "private":
         await update.effective_message.reply_text("Scrivi /help oppure usa /ask <domanda> 🙂")
 
 
-# ----------------------------
-# Application builder
-# ----------------------------
-def _warmup_index() -> None:
-    global INDEX
-    INDEX = build_index(PDF_DIR)
-    logger.info(
-        "CF77 RAG pronto. books=%s pages=%s text_pages=%s chars=%s dir=%s pdfreader=%s",
-        INDEX.books, INDEX.pages, INDEX.text_pages, INDEX.chars, PDF_DIR, HAVE_PYPDF
-    )
-
+# ─────────────────────────────────────────
+# ✅ post_init — DEVE essere async in PTB v21
+# ─────────────────────────────────────────
 async def post_init(app: Application) -> None:
-    # Runs in PTB event loop at startup
-    _warmup_index()
+    """Chiamato da PTB dopo initialize(). Costruisce l'indice."""
+    logger.info("post_init: avvio build_and_store_index…")
+    await build_and_store_index()
+    logger.info("post_init: indice pronto. books=%d pages=%d", INDEX.books, INDEX.pages)
 
+
+# ─────────────────────────────────────────
+# Application factory
+# ─────────────────────────────────────────
 def build_application() -> Application:
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN mancante nelle env vars")
@@ -365,27 +378,27 @@ def build_application() -> Application:
     app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .post_init(post_init)
+        .post_init(post_init)   # ← async, PTB v21 OK
         .build()
     )
 
+    app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("sources", cmd_sources))
     app.add_handler(CommandHandler("quote", cmd_quote))
     app.add_handler(CommandHandler("ask", cmd_ask))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
     return app
 
 
-# ----------------------------
-# Local polling entrypoint
-# ----------------------------
+# ─────────────────────────────────────────
+# Local polling entrypoint (dev only)
+# ─────────────────────────────────────────
 def main() -> None:
-    logger.info("%s è in ascolto…", BOT_DISPLAY)
-    application = build_application()
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("%s avvio polling locale…", BOT_DISPLAY)
+    build_application().run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
